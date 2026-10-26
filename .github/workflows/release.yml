@@ -1,0 +1,88 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    name: Windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build
+        run: |
+          python -m PyInstaller --onefile --noconfirm --clean --name clipshare clipshare.py
+          python -m PyInstaller --onefile --noconsole --noconfirm --clean --name clipshared clipshare.py
+
+      - name: Package
+        run: |
+          New-Item -ItemType Directory -Force -Path out | Out-Null
+          Copy-Item dist\clipshare.exe out\
+          Copy-Item dist\clipshared.exe out\
+          Copy-Item README.md out\
+          Compress-Archive -Path out\* -DestinationPath clipshare-windows-x64.zip -Force
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipshare-windows-x64
+          path: clipshare-windows-x64.zip
+
+  build-linux:
+    name: Linux x86_64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyInstaller
+        run: python -m pip install --upgrade pip pyinstaller
+
+      - name: Build
+        run: |
+          python -m PyInstaller --onefile --noconfirm --clean --name clipshare clipshare.py
+          chmod +x dist/clipshare
+          mkdir -p out
+          cp dist/clipshare out/
+          cp README.md out/
+          tar -czf clipshare-linux-x64.tar.gz -C out .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: clipshare-linux-x64
+          path: clipshare-linux-x64.tar.gz
+
+  release:
+    name: Publish release
+    needs: [build-windows, build-linux]
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: List assets
+        run: find artifacts -type f -exec ls -lh {} \;
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            artifacts/clipshare-windows-x64/clipshare-windows-x64.zip
+            artifacts/clipshare-linux-x64/clipshare-linux-x64.tar.gz
+          generate_release_notes: true
