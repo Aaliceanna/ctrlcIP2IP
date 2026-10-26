@@ -60,7 +60,10 @@ IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "ClipShare"
 GITHUB_REPO = "Aaliceanna/ctrlcIP2IP"
-UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+# 可用 CLIPSHARE_UPDATE_API 指向自建镜像 / 内网更新源（返回同样结构的 JSON）
+UPDATE_API = (os.environ.get("CLIPSHARE_UPDATE_API") or "").strip() or (
+    f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+)
 UPDATE_ZIPBALL = "https://codeload.github.com/{repo}/zip/refs/tags/{tag}"
 
 try:  # 设置面板 HTML（缺失时降级，不影响同步功能）
@@ -1658,24 +1661,45 @@ def update_plan(stage_dir: str) -> dict:
 
 
 def _win_write_updater(plan: list, pid: int, restart_cmd: list[str]) -> str:
-    """生成替换自身的批处理：等进程退出 → 覆盖 exe → 重新启动 → 自删。"""
+    """生成替换自身的批处理：等进程退出 → 覆盖 exe → 重新启动 → 自删。
+
+    注意：这个批处理是「无控制台」启动的（DETACHED_PROCESS），cmd 在这种情况下
+    走管道（`a | b`）会卡住，所以进程存活判断一律用临时文件中转，不能用管道。
+    """
+    probe = os.path.join(UPDATE_DIR, "pidcheck.txt")
     bat = os.path.join(UPDATE_DIR, "apply_update.bat")
     lines = [
         "@echo off",
         "chcp 65001 >nul",
         f'set "PID={pid}"',
+        f'set "PROBE={probe}"',
+        'set "W=0"',
         ":wait",
-        'tasklist /FI "PID eq %PID%" /NH 2>nul | findstr /C:"%PID%" >nul',
+        'tasklist /FI "PID eq %PID%" /NH > "%PROBE%" 2>&1',
+        'findstr /C:"%PID%" "%PROBE%" >nul',
         "if errorlevel 1 goto doit",
         "ping -n 2 127.0.0.1 >nul",
+        "set /A W+=1",
+        # PID 可能被系统复用给别的进程，不能无限等；等不到就直接进入复制阶段，
+        # 由下面的重试循环兜底（文件仍被占用时最多等约 60 秒）。
+        "if %W% GEQ 60 goto doit",
         "goto wait",
         ":doit",
     ]
-    for src, dst in plan:
+    for i, (src, dst) in enumerate(plan):
+        # 单文件打包的程序有父子两层进程，父进程退出瞬间 exe 仍被占用 —— 失败就重试
+        lines.append(f"set \"TRY{i}=0\"")
+        lines.append(f":copy{i}")
         lines.append(f'copy /Y "{src}" "{dst}" >nul')
+        lines.append(f"if not errorlevel 1 goto done{i}")
+        lines.append("ping -n 2 127.0.0.1 >nul")
+        lines.append(f"set /A TRY{i}+=1")
+        lines.append(f"if %TRY{i}% LSS 60 goto copy{i}")
+        lines.append(f":done{i}")
     if restart_cmd:
         args = " ".join(f'"{a}"' for a in restart_cmd[1:])
         lines.append(f'start "" "{restart_cmd[0]}" {args}')
+    lines.append('del "%PROBE%"')
     lines.append('del "%~f0"')
     with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
         f.write("\n".join(lines) + "\n")
