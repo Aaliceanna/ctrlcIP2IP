@@ -2059,11 +2059,21 @@ def _pid_alive(pid) -> bool:
         return True
     if IS_WIN:
         try:
-            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
-            if h:
-                ctypes.windll.kernel32.CloseHandle(h)
-                return True
-            return False
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.OpenProcess.restype = ctypes.c_void_p
+            k32.OpenProcess.argtypes = [ctypes.c_uint32, ctypes.c_int, ctypes.c_uint32]
+            h = k32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFORMATION
+            if not h:
+                return False
+            try:
+                # 光看句柄不够：已经退出但还没被回收的进程同样能拿到句柄，
+                # 必须再问一次退出码，STILL_ACTIVE(259) 才算真的活着。
+                code = ctypes.c_ulong(0)
+                if not k32.GetExitCodeProcess(ctypes.c_void_p(h), ctypes.byref(code)):
+                    return False
+                return code.value == 259
+            finally:
+                k32.CloseHandle(ctypes.c_void_p(h))
         except Exception:
             return False
     try:
