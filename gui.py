@@ -55,6 +55,8 @@ class TrayApp:
             MenuItem("详细日志", self._toggle_debug, checked=lambda i: self.h["debug"]()),
             Menu.SEPARATOR,
             MenuItem("复制我的配对链接", self._copy_link),
+            MenuItem(lambda i: self.h["fw_label"](), self._toggle_fw,
+                     checked=lambda i: self.h["fw_open"]()),
             MenuItem("打开日志文件", self._open_log),
             MenuItem("开机自启", self._toggle_autostart, checked=lambda i: self.h["autostart"]()),
             Menu.SEPARATOR,
@@ -87,6 +89,10 @@ class TrayApp:
 
     def _toggle_autostart(self, icon=None, item=None) -> None:
         self.h["toggle_autostart"]()
+
+    def _toggle_fw(self, icon=None, item=None) -> None:
+        msg = self.h["toggle_fw"]()
+        self._notify(msg)
 
     def _copy_link(self, icon=None, item=None) -> None:
         link = self.h["copy_link"]()

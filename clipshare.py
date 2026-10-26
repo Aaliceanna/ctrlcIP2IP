@@ -23,10 +23,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import collections
 import ctypes
 import hmac
 import json
+import locale
 import logging
 import logging.handlers
 import os
@@ -34,6 +36,8 @@ import queue
 import re
 import secrets
 import shlex
+import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -46,7 +50,7 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -286,6 +290,9 @@ def default_config() -> dict:
         "poll_ms": 200,
         "sync_files": False,
         "log_level": "info",   # info | debug（托盘/面板可切换）
+        "fw_autocheck": True,  # 绑定/启动时自动检测防火墙与连通性
+        "fw_autoopen": False,  # 检测到被拦截时自动放行（False=只在用户点确认后放行）
+        "fw_mode": "temp",     # temp=退出/闪退自动恢复；persist=常驻规则
     }
 
 
@@ -317,6 +324,9 @@ def load_config() -> dict:
     adv = str(cfg.get("advertise") or "").strip()
     cfg["advertise"] = "" if adv.lower() in ("auto", "自动") else adv
     cfg["port_auto"] = bool(cfg.get("port_auto", True))
+    cfg["fw_autocheck"] = bool(cfg.get("fw_autocheck", True))
+    cfg["fw_autoopen"] = bool(cfg.get("fw_autoopen", False))
+    cfg["fw_mode"] = "persist" if str(cfg.get("fw_mode", "temp")).lower() == "persist" else "temp"
     if not (1 <= cfg["port"] <= 65535):
         cfg["port"] = 8765
         changed = True
@@ -701,6 +711,9 @@ class Handler(BaseHTTPRequestHandler):
                         "max_kb": cfg["max_kb"],
                         "poll_ms": cfg["poll_ms"],
                         "log_level": cfg.get("log_level", "info"),
+                        "fw_autocheck": bool(cfg.get("fw_autocheck", True)),
+                        "fw_autoopen": bool(cfg.get("fw_autoopen", False)),
+                        "fw_mode": cfg.get("fw_mode", "temp"),
                     },
                     "autostart": autostart_installed(),
                 },
@@ -708,6 +721,8 @@ class Handler(BaseHTTPRequestHandler):
         if path.path == "/api/reload":
             ok = CORE.reload()
             return self._json(200, {"ok": ok, "peers": len(CORE.cfg.get("peers") or [])})
+        if path.path == "/api/firewall":
+            return self._json(200, fw_check())
         if path.path == "/api/shutdown":
             self._json(200, {"ok": True})
             threading.Thread(target=_shutdown, daemon=True).start()
@@ -758,11 +773,45 @@ class Handler(BaseHTTPRequestHandler):
                     "token": token,
                     "name": str(body.get("name") or host),
                 }
+            reverse = bool(body.get("reverse", True))
             updated = upsert_peer(CORE.cfg, peer)
             CORE.reload()
             ok, detail = handshake(peer)
             log.info("绑定对端 %s:%s（%s）→ %s", peer["host"], peer["port"],
                      "更新" if updated else "新增", "成功" if ok else detail)
+
+            # 双向：让对方也把我加进去，一次绑定两边互通
+            rev: dict = {"ok": False, "skipped": True, "error": ""}
+            if reverse and ok:
+                rev = reverse_bind(CORE.cfg, peer)
+                if rev.get("ok"):
+                    log.info("双向绑定成功：对方已把本机加入对端列表（%s）", rev.get("detail") or "ok")
+                elif not rev.get("skipped"):
+                    log.warning("对方未能回绑本机：%s", rev.get("error"))
+                for p in CORE.cfg.get("peers") or []:
+                    if peer_key(p) == peer_key(peer):
+                        p["mutual"] = bool(rev.get("ok"))
+                        save_config(CORE.cfg)
+                        break
+
+            # 需要时给出防火墙体检结果，让面板可以提示一键放行
+            fw = None
+            if CORE.cfg.get("fw_autocheck", True) and (not ok or not rev.get("ok")):
+                fw = fw_check()
+                if fw.get("state") == "blocked" and CORE.cfg.get("fw_autoopen", False):
+                    opened = fw_open(int(CORE.cfg["port"]), CORE.cfg.get("fw_mode", "temp"))
+                    fw["auto_opened"] = opened
+                    if opened.get("ok"):
+                        ok2, detail2 = handshake(peer)
+                        ok, detail = ok2, detail2
+                        if ok and reverse:
+                            rev = reverse_bind(CORE.cfg, peer)
+                            for p in CORE.cfg.get("peers") or []:
+                                if peer_key(p) == peer_key(peer):
+                                    p["mutual"] = bool(rev.get("ok"))
+                                    save_config(CORE.cfg)
+                                    break
+
             return self._json(
                 200,
                 {
@@ -770,16 +819,91 @@ class Handler(BaseHTTPRequestHandler):
                     "peer": f"{peer['name']} {peer_key(peer)}",
                     "updated": updated,
                     "error": "" if ok else detail,
+                    "reverse": rev,
+                    "mutual": bool(rev.get("ok")),
+                    "firewall": fw,
                 },
+            )
+
+        if path == "/api/peer":
+            """对端主动回绑 / 主动解除：实现一次绑定两边互通。"""
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            src = (self.client_address[0] if self.client_address else "") or ""
+
+            # ---- 解绑通知 ----
+            if body.get("remove"):
+                host = str(body.get("host") or "").strip()
+                try:
+                    port = int(body.get("port") or 0)
+                except (TypeError, ValueError):
+                    port = 0
+                peers = CORE.cfg.get("peers") or []
+                keep = []
+                for p in peers:
+                    ph = str(p.get("host") or "").strip("[]")
+                    pp = int(p.get("port") or 0)
+                    hit = (host and ph == host and (not port or pp == port)) or \
+                          (src and not is_loopback(src) and ph == src and (not port or pp == port))
+                    if not hit:
+                        keep.append(p)
+                n = len(peers) - len(keep)
+                if n:
+                    CORE.cfg["peers"] = keep
+                    save_config(CORE.cfg)
+                    CORE.reload()
+                    log.info("对端通知解绑，已移除 %d 个对端", n)
+                return self._json(200, {"ok": True, "removed": n})
+
+            # ---- 回绑 ----
+            me = body.get("peer") if isinstance(body.get("peer"), dict) else {}
+            try:
+                port = int(me.get("port") or 8765)
+            except (TypeError, ValueError):
+                port = 8765
+            token = str(me.get("token") or "").strip()
+            name = str(me.get("name") or "").strip() or src
+            # 用实际连过来的 IP：对端上报的地址可能是 Clash TUN 之类的假地址
+            host = src if (src and not is_loopback(src)) else str(me.get("host") or src).strip()
+            if not host:
+                return self._json(400, {"ok": False, "error": "拿不到对端地址"})
+            if not token:
+                return self._json(400, {"ok": False, "error": "对端令牌为空"})
+
+            # 不把自己加为对端
+            if host in local_ipv4_list() and int(port) == int(CORE.cfg["port"]):
+                return self._json(200, {"ok": True, "skipped": True, "added": False,
+                                        "error": "对端就是本机，已跳过"})
+            peer = {"host": host, "port": port, "token": token, "name": name, "mutual": True}
+            updated = upsert_peer(CORE.cfg, peer)
+            CORE.reload()
+            ok, detail = handshake(peer, timeout=3.0)
+            log.info("对端 %s 回绑本机（%s:%s）→ %s", name, host, port, "握手成功" if ok else detail)
+            return self._json(
+                200,
+                {"ok": True, "added": not updated, "updated": updated, "skipped": False,
+                 "handshake": ok, "detail": detail, "peer": f"{name} {peer_key(peer)}"},
             )
 
         if path == "/api/unbind":
             body = self._body()
             if not isinstance(body, dict):
                 return self._json(400, {"ok": False, "error": "参数错误"})
-            n = remove_peer(CORE.cfg, str(body.get("key") or ""))
+            key = str(body.get("key") or "")
+            notify = bool(body.get("notify", True))
+            target = None
+            for p in CORE.cfg.get("peers") or []:
+                if key and key in (str(p.get("name")), str(p.get("host")), peer_key(p)):
+                    target = p
+                    break
+            n = remove_peer(CORE.cfg, key)
             CORE.reload()
-            return self._json(200, {"ok": n > 0, "removed": n})
+            told = {"ok": False, "skipped": True}
+            if notify and target is not None:
+                told = reverse_unbind(CORE.cfg, target)
+                log.info("解绑已通知对端 %s（移除 %s 个）", peer_key(target), told.get("removed", 0))
+            return self._json(200, {"ok": n > 0, "removed": n, "notify": told})
 
         if path == "/api/pause":
             body = self._body()
@@ -798,6 +922,13 @@ class Handler(BaseHTTPRequestHandler):
                 apply_log_level(CORE.cfg)
                 save_config(CORE.cfg)
                 log.info("日志级别切换为 %s", CORE.cfg["log_level"])
+            for key in ("fw_autocheck", "fw_autoopen"):
+                if key in body:
+                    CORE.cfg[key] = bool(body[key])
+                    save_config(CORE.cfg)
+            if "fw_mode" in body:
+                CORE.cfg["fw_mode"] = "persist" if str(body["fw_mode"]).lower() == "persist" else "temp"
+                save_config(CORE.cfg)
             if "autostart" in body:
                 if body["autostart"]:
                     install_autostart()
@@ -809,8 +940,29 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "log_level": CORE.cfg.get("log_level", "info"),
                     "autostart": autostart_installed(),
+                    "fw_autocheck": bool(CORE.cfg.get("fw_autocheck", True)),
+                    "fw_autoopen": bool(CORE.cfg.get("fw_autoopen", False)),
+                    "fw_mode": CORE.cfg.get("fw_mode", "temp"),
                 },
             )
+
+        if path == "/api/firewall":
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            action = str(body.get("action") or "check").lower()
+            try:
+                port = int(body.get("port") or CORE.cfg["port"])
+            except (TypeError, ValueError):
+                port = int(CORE.cfg["port"])
+            mode = str(body.get("mode") or CORE.cfg.get("fw_mode", "temp")).lower()
+            if action == "open":
+                res = fw_open(port, mode)
+                return self._json(200 if res.get("ok") or res.get("elevating") else 409, res)
+            if action == "close":
+                res = fw_close(None if body.get("port") in (None, "", 0) else port)
+                return self._json(200 if res.get("ok") else 409, res)
+            return self._json(200, fw_check(port))
 
         if path == "/api/network":
             body = self._body()
@@ -864,10 +1016,19 @@ class Handler(BaseHTTPRequestHandler):
                     "name": p.get("name"),
                     "host": p.get("host"),
                     "port": p.get("port"),
+                    "mutual": bool(p.get("mutual")),
                     "state": CORE.peer_state.get(peer_key(p), {}),
                 }
                 for p in cfg.get("peers") or []
             ],
+            "firewall": {
+                "open": bool(fw_managed(int(cfg["port"]))),
+                "mode": (fw_managed(int(cfg["port"])) or {}).get("mode", cfg.get("fw_mode", "temp")),
+                "backend": fw_backend() or "none",
+                "autocheck": bool(cfg.get("fw_autocheck", True)),
+                "autoopen": bool(cfg.get("fw_autoopen", False)),
+                "fw_mode": cfg.get("fw_mode", "temp"),
+            },
             "push_count": CORE.push_count,
             "recv_count": CORE.recv_count,
             "last_push_at": CORE.last_push_at,
@@ -1139,6 +1300,702 @@ def handshake(peer: dict, timeout: float = 4.0) -> tuple[bool, str]:
         return False, f"{type(exc).__name__}：检查 IP/端口/防火墙/对方是否开机"
 
 
+# --------------------------------------------------------------------------
+# 防火墙放行：用户确认后一键开端口，软件关闭 / 闪退自动恢复
+# --------------------------------------------------------------------------
+# 规则命名统一为 ClipShare-<端口>-<PID>，同时把「谁开的、什么时候开的」记进
+# firewall.json。下次启动（含闪退后重启）先按 PID 存活情况回收孤儿规则，
+# 再兜底扫描同前缀但无记录的规则删除，保证不会在防火墙里留下洞口。
+FW_PREFIX = "ClipShare"
+FW_STATE_PATH = os.path.join(HOME, "firewall.json")
+FW_LOCK = threading.RLock()
+FW_MANAGED: dict = {}          # port -> entry（本进程开过的规则）
+_CLEANUP_REGISTERED = False
+_WIN_CTRL_REF = None           # 防止 ctypes 回调被垃圾回收
+
+
+def _decode_out(raw: bytes) -> str:
+    """netsh / ufw 的输出可能是 UTF-8，也可能是系统 ANSI（中文 GBK），逐个试。"""
+    encs = ["utf-8", locale.getpreferredencoding(False) or "utf-8"]
+    if IS_WIN:
+        encs.append("mbcs")
+    for enc in encs:
+        try:
+            return raw.decode(enc)
+        except Exception:
+            continue
+    return raw.decode("utf-8", errors="replace")
+
+
+def _sh(cmd: list[str], timeout: float = 12.0) -> tuple[int, str]:
+    """执行命令，返回 (returncode, 合并输出)。隐藏窗口，超时不卡死。"""
+    flags = 0x08000000 if IS_WIN else 0  # CREATE_NO_WINDOW
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=timeout, creationflags=flags)
+    except FileNotFoundError:
+        return 127, "找不到命令：" + (cmd[0] if cmd else "?")
+    except subprocess.TimeoutExpired:
+        return 124, "命令超时"
+    except Exception as exc:
+        return 126, f"{type(exc).__name__}: {exc}"
+    raw = (r.stdout or b"") + (b"\n" + r.stderr if r.stderr else b"")
+    return r.returncode, _decode_out(raw).strip()
+
+
+def _pid_alive(pid) -> bool:
+    try:
+        pid = int(pid)
+    except (TypeError, ValueError):
+        return False
+    if pid <= 0:
+        return False
+    if pid == os.getpid():
+        return True
+    if IS_WIN:
+        try:
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)  # QUERY_LIMITED_INFO
+            if h:
+                ctypes.windll.kernel32.CloseHandle(h)
+                return True
+            return False
+        except Exception:
+            return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except OSError:
+        return False
+    except Exception:
+        return False
+
+
+def fw_backend() -> str:
+    """返回可用的防火墙后端：netsh / ufw / firewalld / iptables / "" """
+    if IS_WIN:
+        return "netsh"
+    for exe, name in (("ufw", "ufw"), ("firewall-cmd", "firewalld"), ("iptables", "iptables")):
+        if shutil.which(exe):
+            return name
+    return ""
+
+
+def fw_rule_name(port: int, pid: int | None = None) -> str:
+    return f"{FW_PREFIX}-{int(port)}-{int(pid if pid else os.getpid())}"
+
+
+# ---- 状态文件 ----
+def fw_state_load() -> dict:
+    try:
+        with open(FW_STATE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f) or {}
+    except Exception:
+        data = {}
+    data.setdefault("rules", [])
+    return data
+
+
+def fw_state_save(st: dict) -> None:
+    tmp = FW_STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(st, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, FW_STATE_PATH)
+
+
+def fw_state_upsert(entry: dict) -> None:
+    with FW_LOCK:
+        st = fw_state_load()
+        key = str(entry.get("name"))
+        for i, e in enumerate(st["rules"]):
+            if str(e.get("name")) == key or (
+                int(e.get("port") or 0) == int(entry.get("port") or 0)
+            ):
+                st["rules"][i] = entry
+                break
+        else:
+            st["rules"].append(entry)
+        fw_state_save(st)
+
+
+def fw_state_drop(entry: dict) -> None:
+    with FW_LOCK:
+        st = fw_state_load()
+        st["rules"] = [
+            e for e in st["rules"]
+            if str(e.get("name")) != str(entry.get("name"))
+        ]
+        fw_state_save(st)
+
+
+# ---- Windows 防火墙（netsh） ----
+def _win_has_admin() -> bool:
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def _win_elevate(params: str) -> bool:
+    """用 ShellExecute(runas) 弹出 UAC，请求管理员执行一条内部命令。"""
+    exe = sys.executable
+    args = params
+    if not is_frozen():
+        args = f'"{os.path.abspath(__file__)}" {params}'
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
+        return int(rc) > 32
+    except Exception:
+        return False
+
+
+def _win_rule_add(name: str, port: int) -> tuple[bool, str]:
+    rc, out = _sh(
+        [
+            "netsh", "advfirewall", "firewall", "add", "rule",
+            f"name={name}", "dir=in", "action=allow", "protocol=TCP",
+            f"localport={int(port)}", "profile=any", "enable=yes",
+            f"description={FW_PREFIX} temp allow TCP {int(port)}",
+        ]
+    )
+    if rc == 0:
+        return True, out
+    return False, out or f"netsh 退出码 {rc}"
+
+
+def _win_rule_del(name: str) -> tuple[bool, str]:
+    rc, out = _sh(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"])
+    if rc == 0:
+        return True, out
+    # 规则本来就不存在，也算“已恢复”
+    if re.search(r"(没有与指定标准相匹配的规则|No rules match)", out or ""):
+        return True, out
+    return False, out or f"netsh 退出码 {rc}"
+
+
+def _win_rule_exists(name: str) -> bool:
+    rc, out = _sh(["netsh", "advfirewall", "firewall", "show", "rule", f"name={name}"])
+    return rc == 0 and name.lower() in out.lower()
+
+
+def _win_rule_blocks(timeout: float = 20.0) -> list[dict]:
+    rc, out = _sh(["netsh", "advfirewall", "firewall", "show", "rule", "name=all"], timeout)
+    if rc != 0:
+        return []
+    keys = {
+        "rule name": "name", "规则名称": "name",
+        "enabled": "enabled", "已启用": "enabled", "启用": "enabled",
+        "direction": "direction", "方向": "direction",
+        "action": "action", "操作": "action",
+        "localport": "localport", "本地端口": "localport",
+        "protocol": "protocol", "协议": "protocol",
+    }
+    blocks: list[dict] = []
+    cur: dict = {}
+    for line in out.splitlines():
+        line = line.strip()
+        if not line:
+            if cur:
+                blocks.append(cur)
+                cur = {}
+            continue
+        sep = ":" if ":" in line else ("：" if "：" in line else "")
+        if not sep:
+            continue
+        k, _, v = line.partition(sep)
+        key = keys.get(k.strip().lower())
+        if key:
+            cur[key] = v.strip()
+    if cur:
+        blocks.append(cur)
+    return blocks
+
+
+def _win_rule_names() -> list[str]:
+    prefix = FW_PREFIX.lower() + "-"
+    names = []
+    for b in _win_rule_blocks():
+        n = (b.get("name") or "").strip()
+        if n.lower().startswith(prefix):
+            names.append(n)
+    return names
+
+
+def _yes(v: str) -> bool:
+    return str(v).strip().lower() in ("yes", "true", "是", "启用", "1", "on")
+
+
+def _port_in_list(value: str, port: int) -> bool:
+    v = (value or "").strip()
+    if v.lower() in ("any", "all", "*", "任何", "全部"):
+        return True
+    for part in re.split(r"[,\s]+", v):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, _, b = part.partition("-")
+            if a.isdigit() and b.isdigit() and int(a) <= int(port) <= int(b):
+                return True
+        elif part.isdigit() and int(part) == int(port):
+            return True
+    return False
+
+
+def _win_port_allowed(port: int) -> bool:
+    for b in _win_rule_blocks():
+        if not _yes(b.get("enabled", "yes")):
+            continue
+        d = (b.get("direction") or "").lower()
+        if d and d not in ("in", "inbound", "入站", "入"):
+            continue
+        a = (b.get("action") or "").lower()
+        if a and a not in ("allow", "允许"):
+            continue
+        if _port_in_list(b.get("localport") or "", int(port)):
+            return True
+    return False
+
+
+def _win_firewall_on() -> bool:
+    rc, out = _sh(["netsh", "advfirewall", "show", "currentprofile"])
+    if rc != 0:
+        return False
+    # 中文输出形如「状态                                  启用」（空格分隔，无冒号）
+    m = re.search(r"(?im)^\s*(state|状态)\s*[:：]?\s*(.+?)\s*$", out)
+    if not m:
+        return False
+    v = m.group(2).strip().lower()
+    return v.startswith("on") or ("启用" in v) or ("打开" in v) or v in ("开", "yes", "true")
+
+
+# ---- Linux 防火墙 ----
+def _lin_cmd(port: int, add: bool) -> list[str] | None:
+    be = fw_backend()
+    p = f"{int(port)}/tcp"
+    if be == "ufw":
+        return ["ufw", "allow" if add else "delete allow", p] if add else ["ufw", "delete", "allow", p]
+    if be == "firewalld":
+        return ["firewall-cmd", "--add-port" if add else "--remove-port", p]
+    if be == "iptables":
+        verb = "-I" if add else "-D"
+        return ["iptables", verb, "INPUT", "-p", "tcp", "--dport", str(int(port)), "-j", "ACCEPT"]
+    return None
+
+
+def _lin_apply(port: int, add: bool) -> tuple[bool, str]:
+    cmd = _lin_cmd(port, add)
+    if not cmd:
+        return False, "未检测到 ufw / firewalld / iptables，无法自动放行"
+    rc, out = _sh(cmd)
+    if rc == 0:
+        return True, out
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        return False, out or f"退出码 {rc}"
+    for tool in ("sudo", "pkexec"):
+        if shutil.which(tool):
+            pre = ["sudo", "-n"] if tool == "sudo" else ["pkexec"]
+            rc2, out2 = _sh(pre + cmd)
+            if rc2 == 0:
+                return True, out2
+    return False, out or f"退出码 {rc}（需要 root 权限）"
+
+
+def _lin_port_allowed(port: int) -> bool:
+    be = fw_backend()
+    if be == "iptables":
+        rc, out = _sh(["iptables", "-S", "INPUT"])
+        return rc == 0 and re.search(rf"-p tcp .*--dport {int(port)} .*-j ACCEPT", out) is not None
+    if be == "ufw":
+        rc, out = _sh(["ufw", "status"])
+        return rc == 0 and re.search(rf"^{int(port)}/tcp\s", out, re.M) is not None
+    if be == "firewalld":
+        rc, out = _sh(["firewall-cmd", "--list-ports"])
+        return rc == 0 and f"{int(port)}/tcp" in out
+    return False
+
+
+# ---- 统一入口 ----
+def _rule_add(port: int, name: str) -> tuple[bool, str]:
+    if IS_WIN:
+        return _win_rule_add(name, port)
+    return _lin_apply(port, True)
+
+
+def _rule_del(entry: dict) -> tuple[bool, str]:
+    if IS_WIN:
+        return _win_rule_del(str(entry.get("name") or fw_rule_name(entry.get("port") or 0, entry.get("pid"))))
+    return _lin_apply(int(entry.get("port") or 0), False)
+
+
+def fw_managed(port: int) -> dict | None:
+    for e in fw_state_load()["rules"]:
+        if int(e.get("port") or 0) == int(port):
+            return e
+    return None
+
+
+def fw_check(port: int | None = None, bind: str | None = None, deep: bool = True) -> dict:
+    """体检：防火墙是否开启、端口是否已放行、有没有明显的自缚手脚配置。"""
+    cfg = CORE.cfg if CORE else load_config()
+    port = int(port or cfg["port"])
+    bind = bind or cfg.get("bind", "0.0.0.0")
+    backend = fw_backend()
+    hints: list[str] = []
+    listening = False
+    probe_host = local_service_addr({"bind": bind})
+    try:
+        with socket.create_connection((probe_host, port), timeout=0.6):
+            listening = True
+    except Exception:
+        listening = bool(SERVER is not None and int(SERVER.server_address[1]) == port)
+
+    rule = fw_managed(port)
+    rule_exists = False
+    if rule and IS_WIN:
+        rule_exists = _win_rule_exists(str(rule.get("name")))
+    elif rule:
+        rule_exists = _lin_port_allowed(port)
+    port_allowed = rule_exists
+    firewall_on = False
+    if backend == "netsh":
+        firewall_on = _win_firewall_on()
+        if deep and not rule_exists:
+            port_allowed = _win_port_allowed(port)
+    elif backend:
+        firewall_on = True
+        if deep and not rule_exists:
+            port_allowed = _lin_port_allowed(port)
+
+    if str(bind) in ("127.0.0.1", "::1", "localhost"):
+        hints.append(f"监听地址是 {bind}，其它机器根本连不进来，建议改成 0.0.0.0 或本机内网 IP")
+    if not listening:
+        hints.append(f"当前没有在 {bind}:{port} 上监听到服务（服务未运行或端口已变）")
+    if not backend:
+        hints.append("没检测到可管理的防火墙（Windows 防火墙 / ufw / firewalld / iptables），可能装的是第三方安全软件，需要手动放行")
+    elif firewall_on and not port_allowed:
+        hints.append(f"防火墙已开启，但没有放行 TCP {port} 的入站规则 —— 对端很可能连不进来")
+    elif firewall_on and port_allowed and not rule_exists:
+        hints.append(f"TCP {port} 已有放行规则（非 ClipShare 创建），无需处理")
+    elif rule_exists:
+        hints.append(f"TCP {port} 已放行（规则 {rule.get('name')}，{'退出自动恢复' if rule.get('mode') != 'persist' else '常驻'}）")
+
+    if not backend:
+        state = "unknown"
+    elif firewall_on and not port_allowed:
+        state = "blocked"
+    elif firewall_on:
+        state = "ok"
+    else:
+        state = "ok"
+    managed = []
+    stale = 0
+    for e in fw_state_load()["rules"]:
+        alive = _pid_alive(e.get("pid"))
+        dead_owner = (not alive) and int(e.get("pid") or 0) != os.getpid()
+        if dead_owner:
+            stale += 1
+        managed.append({
+            "port": int(e.get("port") or 0),
+            "mode": e.get("mode", "temp"),
+            "rule": e.get("name", ""),
+            "alive": alive,
+            "stale": dead_owner,
+        })
+    if stale:
+        hints.append(
+            f"发现 {stale} 条上次异常退出遗留的放行规则，点“恢复”即可撤销（需要管理员授权）"
+        )
+    return {
+        "ok": True,
+        "port": port,
+        "bind": bind,
+        "backend": backend or "none",
+        "supported": bool(backend),
+        "listening": listening,
+        "firewall_on": firewall_on,
+        "rule_exists": rule_exists,
+        "port_allowed": port_allowed,
+        "state": state,
+        "need_admin": IS_WIN and not _win_has_admin(),
+        "mode": (rule or {}).get("mode", cfg.get("fw_mode", "temp")),
+        "rule": (rule or {}).get("name", ""),
+        "managed": managed,
+        "stale": stale,
+        "hints": hints,
+        "message": "；".join(hints) or f"TCP {port} 通信正常",
+    }
+
+
+def fw_open(port: int, mode: str = "temp", elevate: bool = True, pid: int | None = None) -> dict:
+    port = int(port)
+    mode = "persist" if str(mode).lower() == "persist" else "temp"
+    owner = int(pid or os.getpid())
+    name = fw_rule_name(port, owner)
+    entry = {
+        "name": name,
+        "port": port,
+        "pid": owner,
+        "mode": mode,
+        "backend": fw_backend(),
+        "ts": int(time.time()),
+    }
+    if IS_WIN:
+        ok, err = _win_rule_add(name, port)
+        if not ok:
+            if elevate and not _win_has_admin():
+                if _win_elevate(f"fw --open --port {port} --mode {mode} --pid {os.getpid()}"):
+                    threading.Thread(
+                        target=_wait_elevated_rule, args=(name, port, mode), daemon=True,
+                        name="fw-wait",
+                    ).start()
+                    return {
+                        "ok": False, "elevating": True, "port": port, "mode": mode, "rule": name,
+                        "error": "已弹出管理员授权窗口，请在 UAC 里点“是”；放行成功后面板会自动刷新",
+                    }
+                return {"ok": False, "port": port, "error": "无法请求管理员权限：" + (err or "未知原因")}
+            return {"ok": False, "port": port, "error": err or "放行失败（netsh 返回非零）"}
+    else:
+        ok, err = _lin_apply(port, True)
+        if not ok:
+            return {"ok": False, "port": port, "error": err or "放行失败"}
+    fw_state_upsert(entry)
+    FW_MANAGED[port] = entry
+    log.info("已放行 TCP %s（%s）规则=%s", port,
+             "常驻" if mode == "persist" else "临时，退出自动恢复", name)
+    return {"ok": True, "port": port, "mode": mode, "rule": name}
+
+
+def _wait_elevated_rule(name: str, port: int, mode: str) -> None:
+    """等 UAC 子进程把规则写进来（用户点授权的时间不可控，最多等 60 秒）。"""
+    for _ in range(60):
+        time.sleep(1.0)
+        if _win_rule_exists(name):
+            entry = {
+                "name": name, "port": int(port), "pid": os.getpid(), "mode": mode,
+                "backend": "netsh", "ts": int(time.time()),
+            }
+            fw_state_upsert(entry)
+            FW_MANAGED[int(port)] = entry
+            log.info("管理员授权成功，TCP %s 已放行（%s）", port,
+                     "常驻" if mode == "persist" else "临时，退出自动恢复")
+            return
+    log.warning("等待管理员放行超时（TCP %s）：UAC 可能已被取消", port)
+
+
+def _elevate_fw(params: str) -> bool:
+    if not IS_WIN or _win_has_admin():
+        return False
+    return _win_elevate(params)
+
+
+def fw_close(port: int | None = None) -> dict:
+    """关闭放行。port 为空 = 恢复全部。删不掉时（没管理员权限）弹一次 UAC 兜底。"""
+    st = fw_state_load()
+    targets = [e for e in st["rules"] if port is None or int(e.get("port") or 0) == int(port)]
+    if not targets:
+        return {"ok": True, "closed": 0, "error": "", "note": "没有需要恢复的规则"}
+    done, errs = 0, []
+    for e in targets:
+        ok, err = _rule_del(e)
+        if ok:
+            done += 1
+            fw_state_drop(e)
+            FW_MANAGED.pop(int(e.get("port") or 0), None)
+        else:
+            errs.append(f"{e.get('name')}: {err or '失败'}")
+    if done:
+        log.info("已恢复 %d 条防火墙放行规则", done)
+    if errs and _elevate_fw("fw --close --all"):
+        return {
+            "ok": True, "closed": done, "elevating": True,
+            "error": "剩余规则需要管理员权限，已弹出授权窗口，点“是”即可恢复",
+        }
+    return {"ok": not errs, "closed": done, "error": "；".join(errs)}
+
+
+def fw_cleanup_all(reason: str = "") -> int:
+    """退出/闪退恢复：删除本进程开的临时规则（常驻规则保留）。"""
+    st = fw_state_load()
+    n = 0
+    leftover: list[dict] = []
+    for e in list(st["rules"]):
+        if e.get("mode") == "persist":
+            continue
+        pid = e.get("pid")
+        if pid and int(pid) != os.getpid() and _pid_alive(pid):
+            continue  # 另一个 ClipShare 实例还在用，别动
+        ok, _ = _rule_del(e)
+        if ok:
+            fw_state_drop(e)
+            FW_MANAGED.pop(int(e.get("port") or 0), None)
+            n += 1
+        else:
+            leftover.append(e)
+    if n:
+        log.info("防火墙已恢复：删除 %d 条临时放行规则%s", n, f"（{reason}）" if reason else "")
+    # 没管理员权限删不掉时，弹一次 UAC 兜底（点“是”即恢复，点“否”留给下次启动回收）
+    if leftover and _elevate_fw("fw --close --all"):
+        log.info("已请求管理员权限恢复 %d 条遗留规则", len(leftover))
+    return n
+
+
+def fw_reap_stale() -> int:
+    """启动时回收上次闪退 / 强杀遗留的规则。"""
+    st = fw_state_load()
+    n = 0
+    for e in list(st["rules"]):
+        if e.get("mode") == "persist":
+            continue
+        pid = e.get("pid")
+        if not pid or int(pid) == os.getpid():
+            continue  # 本进程自己正在用的不动
+        if _pid_alive(pid):
+            continue
+        ok, err = _rule_del(e)
+        if ok:
+            fw_state_drop(e)
+            n += 1
+        else:
+            log.warning(
+                "上次遗留的放行规则 %s（TCP %s）未能自动恢复：%s",
+                e.get("name"), e.get("port"), (err or "")[:120],
+            )
+    if IS_WIN:
+        known = {str(e.get("name")) for e in fw_state_load()["rules"]}
+        try:
+            for nm in _win_rule_names():
+                if nm not in known:
+                    if _win_rule_del(nm)[0]:
+                        n += 1
+        except Exception as exc:
+            log.debug("孤儿规则扫描失败: %s", exc)
+    if n:
+        log.warning("已清理上次异常退出遗留的防火墙规则 %d 条", n)
+    return n
+
+
+def fw_migrate(old_port: int, new_port: int) -> None:
+    """换端口后把放行规则跟着搬过去。"""
+    old_port, new_port = int(old_port), int(new_port)
+    if old_port == new_port:
+        return
+    e = fw_managed(old_port)
+    if not e:
+        return
+    mode = e.get("mode", "temp")
+    fw_close(old_port)
+    fw_open(new_port, mode, elevate=False)
+    log.info("端口 %s → %s，放行规则已同步迁移（%s）", old_port, new_port, mode)
+
+
+def _win_install_ctrl_handler() -> None:
+    """控制台被关掉 / 注销 / 关机时也能把端口恢复回去。"""
+    global _WIN_CTRL_REF
+    try:
+        PHANDLER = ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_uint)
+
+        def _cb(event: int) -> bool:
+            if event in (0, 2, 5, 6):  # CTRL_C / CTRL_CLOSE / LOGOFF / SHUTDOWN
+                try:
+                    fw_cleanup_all(f"控制台事件 {event}")
+                except Exception:
+                    pass
+            return False
+
+        _WIN_CTRL_REF = PHANDLER(_cb)
+        ctypes.windll.kernel32.SetConsoleCtrlHandler(_WIN_CTRL_REF, True)
+    except Exception:
+        pass
+
+
+def _posix_signal_handler(signum, frame) -> None:
+    try:
+        fw_cleanup_all(f"信号 {signum}")
+    except Exception:
+        pass
+    if signum == getattr(signal, "SIGINT", 2):
+        raise KeyboardInterrupt
+    sys.exit(0)
+
+
+def fw_register_exit_hooks() -> None:
+    """注册退出/崩溃清理钩子（atexit + 控制台事件 + 信号），保证不留洞口。"""
+    global _CLEANUP_REGISTERED
+    if _CLEANUP_REGISTERED:
+        return
+    _CLEANUP_REGISTERED = True
+    atexit.register(lambda: fw_cleanup_all("进程退出"))
+    if IS_WIN:
+        _win_install_ctrl_handler()
+    else:
+        for sig in (getattr(signal, "SIGTERM", None), getattr(signal, "SIGHUP", None)):
+            if sig is None:
+                continue
+            try:
+                signal.signal(sig, _posix_signal_handler)
+            except Exception:
+                pass
+
+
+def fw_startup_housekeeping() -> None:
+    """启动时的防火墙善后：后台回收遗留规则 + 注册退出钩子。"""
+    fw_register_exit_hooks()
+    threading.Thread(target=fw_reap_stale, daemon=True, name="fw-reap").start()
+
+
+# ---- 双向绑定：绑完让对方也把我加进去 ----
+def self_peer(cfg: dict) -> dict:
+    return {
+        "host": advertise_host(cfg),
+        "port": int(cfg["port"]),
+        "token": cfg["token"],
+        "name": cfg["name"],
+    }
+
+
+def reverse_bind(cfg: dict, peer: dict, timeout: float = 4.0) -> dict:
+    """告诉对端「把我也加为对端」，实现一次绑定双向互通。"""
+    try:
+        _, obj = http_json(
+            peer_base(peer) + "/api/peer",
+            {"peer": self_peer(cfg)},
+            token=peer.get("token", ""),
+            timeout=timeout,
+        )
+        return {
+            "ok": bool(obj.get("ok")),
+            "skipped": bool(obj.get("skipped")),
+            "added": bool(obj.get("added")),
+            "updated": bool(obj.get("updated")),
+            "handshake": bool(obj.get("handshake")),
+            "error": obj.get("error") or "",
+            "detail": obj.get("detail") or "",
+        }
+    except urllib.error.HTTPError as exc:
+        msg = "令牌不匹配（请重新复制对方配对链接）" if exc.code in (401, 403) else f"HTTP {exc.code}"
+        return {"ok": False, "error": msg}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}：连不上对方（IP/端口/防火墙/对方是否在线）"}
+
+
+def reverse_unbind(cfg: dict, peer: dict, timeout: float = 3.0) -> dict:
+    """解绑时通知对方把我删掉，避免单向残留。"""
+    try:
+        _, obj = http_json(
+            peer_base(peer) + "/api/peer",
+            {"remove": True, "host": advertise_host(cfg), "port": int(cfg["port"])},
+            token=peer.get("token", ""),
+            timeout=timeout,
+        )
+        return {"ok": bool(obj.get("ok")), "removed": int(obj.get("removed") or 0)}
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}"}
+
+
+def is_loopback(host: str) -> bool:
+    h = str(host or "").strip().strip("[]")
+    return h in ("127.0.0.1", "::1", "localhost", "127.0.0.0")
+
+
 def tail_log(lines: int = 200) -> str:
     try:
         with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
@@ -1394,6 +2251,7 @@ def cmd_run(args, cfg: dict) -> int:
     CORE = Core(cfg)
     CORE.pusher.start()
     threading.Thread(target=poller_loop, args=(CORE,), daemon=True, name="poller").start()
+    fw_startup_housekeeping()  # 回收上次闪退遗留的防火墙规则 + 注册退出自动恢复
 
     if note and not args.silent:
         print(note)
@@ -1412,6 +2270,7 @@ def cmd_run(args, cfg: dict) -> int:
     finally:
         CORE.stop_event.set()
         _stop_server(SERVER)
+        fw_cleanup_all("服务停止")
         log.info("已停止")
     return 0
 
@@ -1493,6 +2352,7 @@ def _start_service(cfg: dict):
     threading.Thread(
         target=SERVER.serve_forever, kwargs={"poll_interval": 0.4}, daemon=True, name="http"
     ).start()
+    fw_startup_housekeeping()  # 回收上次闪退遗留的防火墙规则 + 注册退出自动恢复
     if note:
         CORE.port_note = note
     return CORE, SERVER
@@ -1599,6 +2459,8 @@ def rebind_service(bind: str, port: int, advertise: str = "",
             cfg["port_auto"] = bool(port_auto)
         save_config(cfg)
         log.info("监听已更新为 %s:%s，对外公布 %s", bind, port, advertise_host(cfg))
+        if int(port) != old_port:
+            fw_migrate(old_port, int(port))  # 端口变了，放行规则跟着搬
         return {
             "ok": True,
             "bind": bind,
@@ -1632,6 +2494,23 @@ def _toggle_autostart() -> None:
     else:
         install_autostart()
         log.info("已设置开机自启")
+
+
+def _toggle_firewall() -> str:
+    """托盘一键放行 / 恢复：临时规则在退出或闪退后自动撤销。"""
+    port = int(CORE.cfg["port"])
+    mode = CORE.cfg.get("fw_mode", "temp")
+    if fw_managed(port):
+        res = fw_close(port)
+        if res.get("ok"):
+            return f"已恢复：TCP {port} 放行规则已删除（{res.get('closed', 0)} 条）"
+        return f"恢复失败：{res.get('error')}"
+    res = fw_open(port, mode)
+    if res.get("ok"):
+        return f"已放行 TCP {port}（{'常驻' if mode == 'persist' else '退出自动恢复'}）"
+    if res.get("elevating"):
+        return res.get("error") or "已请求管理员权限"
+    return f"放行失败：{res.get('error')}"
 
 
 def _copy_my_link() -> str:
@@ -1718,6 +2597,10 @@ def cmd_gui(args, cfg: dict) -> int:
         "copy_link": _copy_my_link,
         "open_log": _open_log_file,
         "shutdown": _shutdown,
+        "fw_label": lambda: f"防火墙放行 TCP {CORE.cfg['port']}"
+                            + ("（点击恢复）" if fw_managed(int(CORE.cfg["port"])) else "（点击放行）"),
+        "fw_open": lambda: bool(fw_managed(int(CORE.cfg["port"]))),
+        "toggle_fw": _toggle_firewall,
     }
     app = gui.TrayApp(hooks)
     TRAY = app.icon
@@ -1821,6 +2704,7 @@ def cmd_bind(args, cfg: dict) -> int:
     except ValueError as exc:
         print(exc)
         return 2
+    reverse = not getattr(args, "one_way", False)
     peers = cfg.setdefault("peers", [])
     for p in peers:
         if str(p.get("host")) == peer["host"] and int(p.get("port")) == peer["port"]:
@@ -1841,7 +2725,28 @@ def cmd_bind(args, cfg: dict) -> int:
         return 1
     except Exception as exc:
         print(f"握手失败：{type(exc).__name__} —— 检查 IP/端口/防火墙/是否开机")
+        if cfg.get("fw_autocheck", True):
+            fw = fw_check()
+            print(fw_hint_text(fw))
+            if fw.get("state") == "blocked" and cfg.get("fw_autoopen", False):
+                print("按配置自动放行…")
+                print(cmd_fw_open(int(cfg["port"]), cfg.get("fw_mode", "temp")))
         return 1
+
+    # 双向：让对方也把本机加为对端
+    if reverse:
+        rev = reverse_bind(cfg, peer)
+        for p in cfg.get("peers") or []:
+            if peer_key(p) == peer_key(peer):
+                p["mutual"] = bool(rev.get("ok"))
+                save_config(cfg)
+                break
+        if rev.get("ok"):
+            print("双向绑定成功：对方已把本机加入对端列表，两边都能互相推送")
+        elif rev.get("skipped"):
+            print("对方跳过了回绑（可能它认为对端就是自己）")
+        else:
+            print(f"单向绑定成功，但对方未能回绑本机：{rev.get('error')}")
 
     if service_alive(cfg):
         hot = notify_reload(cfg)
@@ -1851,20 +2756,81 @@ def cmd_bind(args, cfg: dict) -> int:
     return 0
 
 
+def fw_hint_text(fw: dict) -> str:
+    if not fw:
+        return ""
+    lines = [f"防火墙体检（{fw.get('backend')}）：{fw.get('message')}"]
+    if fw.get("state") == "blocked":
+        lines.append(f"可执行放行：clipshare-cli.exe fw --open --port {fw.get('port')}")
+    return "\n".join(lines)
+
+
+def cmd_fw_open(port: int, mode: str = "temp", pid: int | None = None) -> str:
+    res = fw_open(port, mode, pid=pid)
+    if res.get("ok"):
+        return f"已放行 TCP {port}（{'常驻' if mode == 'persist' else '临时，退出自动恢复'}）规则={res.get('rule')}"
+    if res.get("elevating"):
+        return res.get("error") or "已请求管理员权限"
+    return f"放行失败：{res.get('error')}"
+
+
+def cmd_fw(args, cfg: dict) -> int:
+    """防火墙检测 / 一键放行 / 恢复。"""
+    port = int(getattr(args, "port", 0) or cfg["port"])
+    mode = str(getattr(args, "mode", "") or cfg.get("fw_mode", "temp")).lower()
+    pid = getattr(args, "pid", None)
+
+    if getattr(args, "open", False):
+        print(cmd_fw_open(port, mode, pid=pid))
+        return 0
+    if getattr(args, "close", False):
+        res = fw_close(None if getattr(args, "all", False) else port)
+        print(f"已恢复 {res.get('closed', 0)} 条规则" if res.get("ok") else f"恢复失败：{res.get('error')}")
+        return 0 if res.get("ok") else 1
+
+    fw = fw_check(port)
+    print(f"端口        : {fw['port']}（监听 {fw['bind']}）")
+    print(f"防火墙后端  : {fw['backend']}")
+    print(f"防火墙开启  : {'是' if fw['firewall_on'] else '否'}")
+    print(f"本端口放行  : {'是' if fw['rule_exists'] else '否'}"
+          f"{'（ClipShare 创建）' if fw['rule_exists'] else ''}")
+    print(f"服务监听中  : {'是' if fw['listening'] else '否'}")
+    print(f"结论        : {fw['message']}")
+    if fw.get("managed"):
+        print("已管理的规则：")
+        for m in fw["managed"]:
+            print(f"  - TCP {m['port']}  {m['mode']}  进程{'存活' if m['alive'] else '已退出'}  {m['rule']}")
+    if fw.get("state") == "blocked":
+        print(f"\n可执行：clipshare-cli.exe fw --open --port {port}  （临时规则，退出自动恢复）")
+        print(f"       clipshare-cli.exe fw --open --port {port} --mode persist  （常驻规则）")
+    return 0
+
+
 def cmd_unbind(args, cfg: dict) -> int:
     key = args.target.strip()
     peers = cfg.get("peers") or []
-    keep = [
-        p for p in peers
-        if not (key in (p.get("name"), str(p.get("host")), f"{p.get('host')}:{p.get('port')}", f"{p.get('name')}@{p.get('host')}:{p.get('port')}"))
-    ]
-    if len(keep) == len(peers):
+    target = None
+    for p in peers:
+        if key in (p.get("name"), str(p.get("host")), peer_key(p),
+                   f"{p.get('name')}@{peer_key(p)}"):
+            target = p
+            break
+    keep = [p for p in peers if p is not target]
+    if target is None:
         print(f"没找到对端：{key}")
         return 1
     cfg["peers"] = keep
     save_config(cfg)
     notify_reload(cfg)
     print(f"已解绑 {len(peers) - len(keep)} 个对端")
+    if not getattr(args, "local_only", False) and target is not None:
+        told = reverse_unbind(cfg, target)
+        if told.get("ok") and told.get("removed"):
+            print(f"已通知对方解除（对方移除 {told['removed']} 个对端）")
+        elif told.get("ok"):
+            print("已通知对方（对方没有匹配的记录）")
+        else:
+            print(f"通知对方失败：{told.get('error')}（对方离线时可在它那边手动删除）")
     return 0
 
 
@@ -2054,13 +3020,27 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--host", help="手动指定 IP / 域名")
     s.set_defaults(fn=cmd_link)
 
-    s = sub.add_parser("bind", help="绑定对端配对链接")
+    s = sub.add_parser("bind", help="绑定对端配对链接（默认双向：对方也会加上本机）")
     s.add_argument("link")
+    s.add_argument("--one-way", dest="one_way", action="store_true",
+                   help="只在本机单向添加，不通知对方回绑")
     s.set_defaults(fn=cmd_bind)
 
-    s = sub.add_parser("unbind", help="解除绑定")
+    s = sub.add_parser("unbind", help="解除绑定（默认也会通知对方解除）")
     s.add_argument("target")
+    s.add_argument("--local-only", dest="local_only", action="store_true",
+                   help="只在本机删除，不通知对方")
     s.set_defaults(fn=cmd_unbind)
+
+    s = sub.add_parser("fw", help="防火墙：检测 / 一键放行 / 恢复")
+    s.add_argument("--open", dest="open", action="store_true", help="放行端口")
+    s.add_argument("--close", dest="close", action="store_true", help="恢复（删除放行规则）")
+    s.add_argument("--all", dest="all", action="store_true", help="恢复全部端口的规则")
+    s.add_argument("--port", type=int, help="端口号，默认取当前配置")
+    s.add_argument("--mode", choices=["temp", "persist"],
+                   help="temp=退出/闪退自动恢复（默认）；persist=常驻")
+    s.add_argument("--pid", type=int, help=argparse.SUPPRESS)  # UAC 提权子进程用
+    s.set_defaults(fn=cmd_fw)
 
     sub.add_parser("peers", help="列出并对端做连通性探测").set_defaults(fn=cmd_peers)
 

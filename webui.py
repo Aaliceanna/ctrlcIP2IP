@@ -55,6 +55,9 @@ HTML_UI = r"""<!DOCTYPE html>
   th{color:var(--muted);font-weight:500;font-size:12px}
   .dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:5px}
   .dot.ok{background:var(--ok)} .dot.bad{background:var(--bad)} .dot.unk{background:#c7cbd1}
+  .mutual{font-size:11px;font-weight:400;color:var(--ok);background:#e8f5ec;
+    border:1px solid #cbe8d4;padding:1px 6px;border-radius:20px;margin-left:4px;white-space:nowrap}
+  .mutual.off{color:#b45309;background:#fef3c7;border-color:#fde68a}
   .switch{display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer}
   .switch input{width:16px;height:16px;accent-color:var(--accent)}
   pre#log{background:#0f172a;color:#d6e2f0;padding:12px;border-radius:8px;height:240px;
@@ -116,15 +119,19 @@ HTML_UI = r"""<!DOCTYPE html>
       <input id="mylink" readonly>
       <button onclick="copyLink()">复制</button>
     </div>
-    <p class="hint">在另一台机器上粘贴绑定即可，需要双向请互相绑定一次。</p>
+    <p class="hint">在另一台机器上粘贴绑定即可。绑定是双向的：A 绑了 B，B 的对端列表里也会自动出现 A。</p>
   </section>
 
   <section class="card">
-    <h2>绑定对端</h2>
+    <h2>绑定对端 <span class="tag">一次绑定，双向互通</span></h2>
     <div class="row">
       <input id="linkinput" placeholder="粘贴配对链接：clipshare://IP:端口/令牌?name=主机名">
       <button class="primary" onclick="bindLink()">绑定</button>
     </div>
+    <label class="switch"><input type="checkbox" id="swReverse" checked> 双向绑定（同时让对方把本机加为对端）</label>
+    <label class="switch"><input type="checkbox" id="swFwCheck" checked> 绑定时检测防火墙 / 连通性，被拦截时提示一键放行</label>
+    <label class="switch"><input type="checkbox" id="swFwAuto"> 检测到被拦截时直接自动放行（不再询问）</label>
+    <div id="bindMsg" class="hint"></div>
     <details>
       <summary>或手动填写 IP / 端口 / 令牌</summary>
       <div class="row3">
@@ -137,6 +144,21 @@ HTML_UI = r"""<!DOCTYPE html>
         <button onclick="bindManual()">绑定</button>
       </div>
     </details>
+  </section>
+
+  <section class="card">
+    <h2>防火墙与端口放行 <span class="tag" id="fwTag">检测中…</span></h2>
+    <div id="fwMsg" class="hint">正在检测…</div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="btnFwOpen" onclick="fwOpen()">一键放行端口（临时）</button>
+      <button id="btnFwClose" onclick="fwClose()">恢复（删除规则）</button>
+      <button onclick="fwCheck()">重新检测</button>
+    </div>
+    <label class="switch"><input type="checkbox" id="swFwPersist"> 放行规则设为常驻（取消勾选＝关闭软件后自动恢复）</label>
+    <p class="hint">
+      临时规则：软件正常退出、闪退、被强杀后都会自动撤销，下次启动还会再扫一遍残留。<br>
+      放行端口需要管理员权限，Windows 会弹一次 UAC，点“是”即可；Linux 需要 sudo / pkexec。
+    </p>
   </section>
 
   <section class="card">
@@ -215,8 +237,11 @@ async function refresh(){
         const ok = p.state && p.state.ok;
         const cls = p.state ? (ok?'ok':'bad') : 'unk';
         const txt = p.state ? (ok?'正常':(p.state.err||'失败')) : '未探测';
+        const mutual = p.mutual
+          ? '<span class="mutual" title="对方也绑定了本机">双向</span>'
+          : '<span class="mutual off" title="只有本机单向绑定，建议重新绑定一次">单向</span>';
         return `<tr>
-          <td>${p.name||''}</td>
+          <td>${p.name||''} ${mutual}</td>
           <td>${p.host}:${p.port}</td>
           <td><span class="dot ${cls}"></span>${txt}</td>
           <td><button class="mini" onclick="unbind('${p.key}')">删除</button></td>
@@ -226,6 +251,14 @@ async function refresh(){
 
     const link = await api('/api/mylink');
     document.getElementById('mylink').value = link.link;
+
+    const cfg = await api('/api/config');
+    const c = cfg.config || {};
+    const ae = document.activeElement;
+    if (!ae || ['swFwCheck','swFwAuto'].indexOf(ae.id) < 0){
+      document.getElementById('swFwCheck').checked = c.fw_autocheck !== false;
+      document.getElementById('swFwAuto').checked = !!c.fw_autoopen;
+    }
   }catch(e){
     document.getElementById('state').textContent='连接失败';
     document.getElementById('state').className='badge off';
@@ -278,12 +311,37 @@ async function copyLink(){
 async function bindLink(){
   const v = document.getElementById('linkinput').value.trim();
   if (!v) return toast('请先粘贴配对链接');
+  const reverse = document.getElementById('swReverse').checked;
   try{
-    const r = await api('/api/bind', {link:v});
-    toast(r.ok ? ('绑定成功：' + (r.peer||'')) : ('失败：' + (r.error||'')));
+    const r = await api('/api/bind', {link:v, reverse});
+    showBindResult(r);
     if (r.ok) document.getElementById('linkinput').value='';
     refresh();
   }catch(e){ toast('绑定失败：' + e.message); }
+}
+
+function showBindResult(r){
+  const box = document.getElementById('bindMsg');
+  if (!box) return;
+  let html = '';
+  if (r.ok){
+    const mutual = r.mutual || (r.reverse && r.reverse.ok);
+    html += mutual
+      ? '<b style="color:var(--ok)">双向绑定成功</b>：对方已把本机加为对端，两边都能互相推送。'
+      : '<b style="color:var(--ok)">单向绑定成功</b>，但对方没能回绑本机'
+        + (r.reverse && r.reverse.error ? '：' + r.reverse.error : '')
+        + '（可让对方也绑一次，或确认对方在线）';
+  } else {
+    html += '<b style="color:var(--bad)">绑定失败</b>：' + (r.error || '未知原因');
+  }
+  if (r.firewall){
+    const fw = r.firewall;
+    html += '<br>防火墙体检：' + (fw.message || '');
+    if (fw.state === 'blocked'){
+      html += '<br><button class="mini" style="margin-top:6px" onclick="fwOpen()">一键放行 TCP ' + fw.port + '</button>';
+    }
+  }
+  box.innerHTML = html;
 }
 
 async function bindManual(){
@@ -293,15 +351,65 @@ async function bindManual(){
   const name = document.getElementById('n').value.trim();
   if (!host || !token) return toast('IP 和令牌必填');
   try{
-    const r = await api('/api/bind', {host, port:parseInt(port,10), token, name});
-    toast(r.ok ? '绑定成功' : ('失败：' + (r.error||'')));
+    const r = await api('/api/bind', {host, port:parseInt(port,10), token, name,
+      reverse: document.getElementById('swReverse').checked});
+    showBindResult(r);
     refresh();
   }catch(e){ toast('绑定失败：' + e.message); }
 }
 
 async function unbind(key){
-  try{ await api('/api/unbind', {key}); toast('已删除'); refresh(); }
+  if (!confirm('解除绑定？同时会通知对方把本机也删掉。')) return;
+  try{
+    const r = await api('/api/unbind', {key, notify:true});
+    const n = r.notify ? ('，对方移除 ' + (r.notify.removed || 0) + ' 个') : '';
+    toast('已删除' + n);
+    refresh();
+  }
   catch(e){ toast('删除失败：' + e.message); }
+}
+
+/* ---------- 防火墙 ---------- */
+async function fwCheck(){
+  try{
+    const f = await api('/api/firewall');
+    const tag = document.getElementById('fwTag');
+    const msg = document.getElementById('fwMsg');
+    const open = !!f.rule_exists;
+    tag.textContent = (f.backend === 'none' ? '未检测到防火墙' : f.backend)
+      + ' · TCP ' + f.port + (open ? ' 已放行' : (f.state === 'blocked' ? ' 疑似被拦截' : ' 正常'));
+    tag.style.background = open ? '#e8f5ec' : (f.state === 'blocked' ? '#fdeaea' : '#f3f4f6');
+    msg.innerHTML = (f.hints || []).map(h=>'· ' + h).join('<br>') || '· 正常';
+    document.getElementById('btnFwOpen').textContent = open ? '已放行' : ('一键放行 TCP ' + f.port + '（临时）');
+    document.getElementById('btnFwOpen').disabled = open;
+    document.getElementById('btnFwClose').disabled = !open;
+    document.getElementById('swFwPersist').checked = (f.mode === 'persist');
+    if (f.need_admin) msg.innerHTML += '<br>· 放行需要管理员权限，点击后会弹一次 UAC';
+    return f;
+  }catch(e){
+    document.getElementById('fwMsg').textContent = '检测失败：' + e.message;
+  }
+}
+
+async function fwOpen(){
+  const persist = document.getElementById('swFwPersist').checked;
+  if (!confirm(persist
+      ? '将添加一条常驻防火墙规则放行该端口，除非手动删除否则不会撤销。继续？'
+      : '将临时放行该端口，ClipShare 关闭或闪退后自动恢复。继续？')) return;
+  try{
+    const r = await api('/api/firewall', {action:'open', mode: persist ? 'persist' : 'temp'});
+    if (r.ok) toast('已放行 TCP ' + r.port);
+    else toast(r.elevating ? '请在 UAC 弹窗中点“是”' : ('放行失败：' + (r.error || '')));
+    setTimeout(fwCheck, 1500);
+  }catch(e){ toast('操作失败：' + e.message); }
+}
+
+async function fwClose(){
+  try{
+    const r = await api('/api/firewall', {action:'close'});
+    toast(r.ok ? ('已恢复，删除 ' + (r.closed || 0) + ' 条规则') : ('恢复失败：' + (r.error || '')));
+    setTimeout(fwCheck, 800);
+  }catch(e){ toast('操作失败：' + e.message); }
 }
 
 async function setPause(el){
@@ -333,9 +441,13 @@ async function loadLog(){
 refresh();
 loadLog();
 loadNet();
+fwCheck();
+document.getElementById('swFwCheck').onchange = (e)=>api('/api/config',{fw_autocheck:e.target.checked});
+document.getElementById('swFwAuto').onchange = (e)=>api('/api/config',{fw_autoopen:e.target.checked});
 setInterval(refresh, 3000);
 setInterval(loadLog, 3000);
 setInterval(loadNet, 6000);
+setInterval(fwCheck, 6000);
 </script>
 </body>
 </html>
