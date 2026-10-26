@@ -2428,6 +2428,17 @@ def _rule_del(entry: dict) -> tuple[bool, str]:
     return _lin_apply(int(entry.get("port") or 0), False)
 
 
+def _rule_exists(entry: dict) -> bool:
+    """这条记录对应的防火墙规则是否真的还存在（用来区分“真遗留”和“记录没清”）。"""
+    try:
+        if IS_WIN:
+            name = str(entry.get("name") or "")
+            return bool(name) and _win_rule_exists(name)
+        return _lin_port_allowed(int(entry.get("port") or 0))
+    except Exception:
+        return False
+
+
 def fw_managed(port: int) -> dict | None:
     for e in fw_state_load()["rules"]:
         if int(e.get("port") or 0) == int(port):
@@ -2493,14 +2504,18 @@ def fw_check(port: int | None = None, bind: str | None = None, deep: bool = True
     for e in fw_state_load()["rules"]:
         alive = _pid_alive(e.get("pid"))
         dead_owner = (not alive) and int(e.get("pid") or 0) != os.getpid()
-        if dead_owner:
+        rule_alive = bool(e.get("name")) and _rule_exists(e)
+        if dead_owner and rule_alive:
+            # 只有「进程已死 且 规则还在」才算真的遗留。守护脚本通常已经把规则删了，
+            # 状态文件里的记录只是没来得及清，不能再吓唬用户。
             stale += 1
         managed.append({
             "port": int(e.get("port") or 0),
             "mode": e.get("mode", "temp"),
             "rule": e.get("name", ""),
             "alive": alive,
-            "stale": dead_owner,
+            "stale": dead_owner and rule_alive,
+            "exists": rule_alive,
         })
     if stale:
         hints.append(
