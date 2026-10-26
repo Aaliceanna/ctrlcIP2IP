@@ -478,12 +478,17 @@ async function fwCheck(){
     const tag = document.getElementById('fwTag');
     const msg = document.getElementById('fwMsg');
     const open = !!f.rule_exists;
+    const selfRule = (!open && f.scope === 'self');
+    const scopeTip = selfRule ? ' 已放行（程序规则）' : (open ? ' 已放行' : ' 正常');
     tag.textContent = (f.backend === 'none' ? '未检测到防火墙' : f.backend)
-      + ' · TCP ' + f.port + (open ? ' 已放行' : (f.state === 'blocked' ? ' 疑似被拦截' : ' 正常'));
-    tag.style.background = open ? '#e8f5ec' : (f.state === 'blocked' ? '#fdeaea' : '#f3f4f6');
+      + ' · TCP ' + f.port + (f.state === 'blocked' ? ' 疑似被拦截' : scopeTip);
+    tag.style.background = (open || selfRule) ? '#e8f5ec' : (f.state === 'blocked' ? '#fdeaea' : '#f3f4f6');
     msg.innerHTML = (f.hints || []).map(h=>'· ' + h).join('<br>') || '· 正常';
-    document.getElementById('btnFwOpen').textContent = open ? '已放行' : ('一键放行 TCP ' + f.port + '（临时）');
-    document.getElementById('btnFwOpen').disabled = open;
+    // 端口已经被系统里指向本程序的规则放行时，按钮只是提示，不能再点（点了会建重复规则）
+    const btn = document.getElementById('btnFwOpen');
+    btn.textContent = open ? '已放行（ClipShare 规则）'
+                    : (selfRule ? '已放行（系统规则）' : ('一键放行 TCP ' + f.port + '（临时）'));
+    btn.disabled = open || selfRule;
     document.getElementById('btnFwClose').disabled = !open;
     document.getElementById('swFwPersist').checked = (f.mode === 'persist');
     if (f.need_admin) msg.innerHTML += '<br>· 放行需要管理员权限，点击后会弹一次 UAC';

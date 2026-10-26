@@ -54,7 +54,7 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -2209,6 +2209,7 @@ def _win_rule_add(name: str, port: int) -> tuple[bool, str]:
         ]
     )
     if rc == 0:
+        _win_blocks_invalidate()
         return True, out
     return False, out or f"netsh 退出码 {rc}"
 
@@ -2266,9 +2267,11 @@ def _win_elevate_open(port: int, name: str, persist: bool, owner_pid: int) -> bo
 def _win_rule_del(name: str) -> tuple[bool, str]:
     rc, out = _sh(["netsh", "advfirewall", "firewall", "delete", "rule", f"name={name}"])
     if rc == 0:
+        _win_blocks_invalidate()
         return True, out
     # 规则本来就不存在，也算“已恢复”
     if re.search(r"(没有与指定标准相匹配的规则|No rules match)", out or ""):
+        _win_blocks_invalidate()
         return True, out
     return False, out or f"netsh 退出码 {rc}"
 
@@ -2278,8 +2281,32 @@ def _win_rule_exists(name: str) -> bool:
     return rc == 0 and name.lower() in out.lower()
 
 
-def _win_rule_blocks(timeout: float = 20.0) -> list[dict]:
-    rc, out = _sh(["netsh", "advfirewall", "firewall", "show", "rule", "name=all"], timeout)
+_WIN_BLOCKS_CACHE: dict[str, tuple[float, list[dict]]] = {}
+
+
+def _win_blocks_invalidate() -> None:
+    """规则表改动后立刻作废缓存，否则面板会读到改动前的旧结果。"""
+    _WIN_BLOCKS_CACHE.clear()
+
+
+def _win_rule_blocks(timeout: float = 20.0, verbose: bool = False,
+                     cache_secs: float = 0.0) -> list[dict]:
+    """解析 netsh 规则表。
+
+    verbose=True 才会输出「程序」字段（判断程序级规则必需），但全量 verbose 输出
+    近 50 万字符、耗时约 1 秒。GUI 会轮询体检，所以允许传 cache_secs 做短时缓存，
+    避免每次都去拉一遍。
+    """
+    ck = "v" if verbose else "n"
+    if cache_secs > 0:
+        hit = _WIN_BLOCKS_CACHE.get(ck)
+        if hit and (time.time() - hit[0]) < cache_secs:
+            return hit[1]
+    cmd = ["netsh", "advfirewall", "firewall", "show", "rule", "name=all"]
+    if verbose:
+        # 只有 verbose 才输出「程序」字段，判断程序级规则必须靠它
+        cmd.append("verbose")
+    rc, out = _sh(cmd, timeout)
     if rc != 0:
         return []
     keys = {
@@ -2289,6 +2316,7 @@ def _win_rule_blocks(timeout: float = 20.0) -> list[dict]:
         "action": "action", "操作": "action",
         "localport": "localport", "本地端口": "localport",
         "protocol": "protocol", "协议": "protocol",
+        "program": "program", "程序": "program",
     }
     blocks: list[dict] = []
     cur: dict = {}
@@ -2308,6 +2336,8 @@ def _win_rule_blocks(timeout: float = 20.0) -> list[dict]:
             cur[key] = v.strip()
     if cur:
         blocks.append(cur)
+    if cache_secs > 0:
+        _WIN_BLOCKS_CACHE[ck] = (time.time(), blocks)
     return blocks
 
 
@@ -2342,22 +2372,87 @@ def _port_in_list(value: str, port: int) -> bool:
     return False
 
 
-def _win_port_allowed(port: int) -> bool:
-    for b in _win_rule_blocks():
+def _self_program_names() -> set[str]:
+    """当前进程自己的可执行文件名（小写）。
+
+    程序级防火墙规则是**按可执行文件绑定**的：给 clipshare-cli.exe 建的规则
+    不会放行 ClipShare.exe。所以这里只能认当前进程自己的名字，不能把两个变体
+    混在一起，否则会误判成「ClipShare 已经被放行」。
+    """
+    names: set[str] = set()
+    for p in (sys.executable, (sys.argv[0] if sys.argv else "")):
+        b = os.path.basename(str(p or "")).strip().lower()
+        # sys.argv[0] 在 python -c / -m 时是 "-c"、"-m" 之类的伪值，不是文件名
+        if b and b not in ("-c", "-m", "") and not b.startswith("-"):
+            names.add(b)
+    return names
+
+
+def _win_port_allow_rules(port: int, cache_secs: float = 0.0) -> list[dict]:
+    """覆盖该端口的入站 TCP 允许规则。
+
+    注意两点老实现漏掉的细节：
+    1. 必须校验协议 —— 只放行 UDP 的规则不能算 TCP 通了；
+    2. 程序级规则（「程序」字段非空）只对那个程序生效，不能算全局放行。
+       所以这里必须用 verbose 输出，只有它才带「程序」字段。
+    """
+    out: list[dict] = []
+    for b in _win_rule_blocks(verbose=True, cache_secs=cache_secs):
         if not _yes(b.get("enabled", "yes")):
             continue
-        d = (b.get("direction") or "").lower()
+        d = (b.get("direction") or "").strip().lower()
         if d and d not in ("in", "inbound", "入站", "入"):
             continue
-        a = (b.get("action") or "").lower()
+        a = (b.get("action") or "").strip().lower()
         if a and a not in ("allow", "允许"):
             continue
+        proto = (b.get("protocol") or "").strip().lower()
+        if proto and proto not in ("tcp", "any", "任何"):
+            continue
         if _port_in_list(b.get("localport") or "", int(port)):
-            return True
-    return False
+            out.append(b)
+    return out
 
 
-def _win_firewall_on() -> bool:
+def _win_port_allowed(port: int) -> bool:
+    """端口是否放行（全局规则或指向本程序的规则都算）。"""
+    return bool(_win_port_check(port)["allowed"])
+
+
+def _win_port_check(port: int, cache_secs: float = 0.0) -> dict:
+    """诊断该端口的入站 TCP 放行情况：全局放行 / 只对本程序 / 只是别的程序。"""
+    rules = _win_port_allow_rules(port, cache_secs=cache_secs)
+    global_rules = [b for b in rules if not str(b.get("program") or "").strip()]
+    mine = _self_program_names()
+    self_rules: list[dict] = []
+    other_rules: list[dict] = []
+    for b in rules:
+        prog = str(b.get("program") or "").strip()
+        if not prog:
+            continue
+        if os.path.basename(prog).strip().lower() in mine:
+            self_rules.append(b)
+        else:
+            other_rules.append(b)
+    return {
+        "port": int(port),
+        "allowed": bool(global_rules or self_rules),
+        "scope": "global" if global_rules else ("self" if self_rules else ("other" if other_rules else "none")),
+        "global": [str(b.get("name") or "") for b in global_rules],
+        "self": [str(b.get("name") or "") for b in self_rules],
+        "other": sorted({str(b.get("name") or "") for b in other_rules})[:5],
+        "other_count": len(other_rules),
+    }
+
+
+_WIN_FWON_CACHE: dict[str, tuple[float, bool]] = {}
+
+
+def _win_firewall_on(cache_secs: float = 0.0) -> bool:
+    if cache_secs > 0:
+        hit = _WIN_FWON_CACHE.get("v")
+        if hit and (time.time() - hit[0]) < cache_secs:
+            return hit[1]
     rc, out = _sh(["netsh", "advfirewall", "show", "currentprofile"])
     if rc != 0:
         return False
@@ -2366,7 +2461,10 @@ def _win_firewall_on() -> bool:
     if not m:
         return False
     v = m.group(2).strip().lower()
-    return v.startswith("on") or ("启用" in v) or ("打开" in v) or v in ("开", "yes", "true")
+    on = v.startswith("on") or ("启用" in v) or ("打开" in v) or v in ("开", "yes", "true")
+    if cache_secs > 0:
+        _WIN_FWON_CACHE["v"] = (time.time(), on)
+    return on
 
 
 # ---- Linux 防火墙 ----
@@ -2468,15 +2566,26 @@ def fw_check(port: int | None = None, bind: str | None = None, deep: bool = True
     elif rule:
         rule_exists = _lin_port_allowed(port)
     port_allowed = rule_exists
+    scope = "self" if rule_exists else "none"
+    other_count = 0
+    other_names: list[str] = []
     firewall_on = False
     if backend == "netsh":
-        firewall_on = _win_firewall_on()
-        if deep and not rule_exists:
-            port_allowed = _win_port_allowed(port)
+        firewall_on = _win_firewall_on(cache_secs=5.0)
+        if deep:
+            # 无论自己有没有规则，都完整判一次：别的程序独占该端口时也要如实告诉用户。
+            # 缓存 5 秒：面板会轮询体检，不能每次都去拉 50 万字符的 verbose 清单。
+            chk = _win_port_check(port, cache_secs=5.0)
+            port_allowed = bool(rule_exists or chk["allowed"])
+            if not rule_exists:
+                scope = chk["scope"]
+                other_count = chk["other_count"]
+                other_names = chk["other"]
     elif backend:
         firewall_on = True
         if deep and not rule_exists:
             port_allowed = _lin_port_allowed(port)
+            scope = "global" if port_allowed else "none"
 
     if str(bind) in ("127.0.0.1", "::1", "localhost"):
         hints.append(f"监听地址是 {bind}，其它机器根本连不进来，建议改成 0.0.0.0 或本机内网 IP")
@@ -2485,9 +2594,17 @@ def fw_check(port: int | None = None, bind: str | None = None, deep: bool = True
     if not backend:
         hints.append("没检测到可管理的防火墙（Windows 防火墙 / ufw / firewalld / iptables），可能装的是第三方安全软件，需要手动放行")
     elif firewall_on and not port_allowed:
-        hints.append(f"防火墙已开启，但没有放行 TCP {port} 的入站规则 —— 对端很可能连不进来")
+        msg = f"防火墙已开启，但没有放行 TCP {port} 的入站规则 —— 对端很可能连不进来"
+        if other_count:
+            names = "、".join(n for n in other_names[:3] if n)
+            msg += (f"（该端口只有其它程序的规则{('：' + names) if names else ''}，"
+                    "那些规则只对它们自己的程序生效，不会让 ClipShare 进来）")
+        hints.append(msg)
     elif firewall_on and port_allowed and not rule_exists:
-        hints.append(f"TCP {port} 已有放行规则（非 ClipShare 创建），无需处理")
+        if scope == "self":
+            hints.append(f"TCP {port} 已放行，但规则是系统里已有的程序规则（非 ClipShare 创建），无需处理")
+        else:
+            hints.append(f"TCP {port} 已有全局放行规则（非 ClipShare 创建），无需处理")
     elif rule_exists:
         hints.append(f"TCP {port} 已放行（规则 {rule.get('name')}，{'退出自动恢复' if rule.get('mode') != 'persist' else '常驻'}）")
 
@@ -2531,6 +2648,7 @@ def fw_check(port: int | None = None, bind: str | None = None, deep: bool = True
         "firewall_on": firewall_on,
         "rule_exists": rule_exists,
         "port_allowed": port_allowed,
+        "scope": scope,
         "state": state,
         "need_admin": IS_WIN and not _win_has_admin(),
         "mode": (rule or {}).get("mode", cfg.get("fw_mode", "temp")),
@@ -3671,11 +3789,19 @@ def cmd_fw(args, cfg: dict) -> int:
         return 0 if res.get("ok") else 1
 
     fw = fw_check(port)
+    scope = fw.get("scope") or "none"
+    if fw["rule_exists"]:
+        allow_txt = "是（ClipShare 创建）"
+    elif fw.get("port_allowed") and scope == "self":
+        allow_txt = "是（系统里已有指向本程序的规则）"
+    elif fw.get("port_allowed") and scope == "global":
+        allow_txt = "是（系统里已有全局规则，非 ClipShare 创建）"
+    else:
+        allow_txt = "否"
     print(f"端口        : {fw['port']}（监听 {fw['bind']}）")
     print(f"防火墙后端  : {fw['backend']}")
     print(f"防火墙开启  : {'是' if fw['firewall_on'] else '否'}")
-    print(f"本端口放行  : {'是' if fw['rule_exists'] else '否'}"
-          f"{'（ClipShare 创建）' if fw['rule_exists'] else ''}")
+    print(f"本端口放行  : {allow_txt}")
     print(f"服务监听中  : {'是' if fw['listening'] else '否'}")
     print(f"结论        : {fw['message']}")
     if fw.get("managed"):
