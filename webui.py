@@ -41,6 +41,12 @@ HTML_UI = r"""<!DOCTYPE html>
   button.mini{padding:2px 8px;font-size:12px}
   .row{display:flex;gap:8px;margin-bottom:8px}
   .row3{display:grid;grid-template-columns:2fr 1fr 2fr;gap:8px;margin:8px 0}
+  .netrow{display:grid;grid-template-columns:1.4fr .8fr;gap:10px;margin:10px 0}
+  .netrow.one{grid-template-columns:1fr}
+  .netrow label{display:block;color:var(--muted);font-size:12px}
+  .netrow input{margin-top:3px}
+  .tag{font-size:11px;font-weight:400;color:var(--muted);margin-left:auto;
+    background:#f3f4f6;padding:2px 8px;border-radius:20px}
   .hint{color:var(--muted);font-size:12px;margin:8px 0 0}
   code{background:#f3f4f6;padding:2px 6px;border-radius:5px;font-size:12px;word-break:break-all}
   details summary{cursor:pointer;color:var(--accent);font-size:12px;margin-bottom:4px}
@@ -78,6 +84,30 @@ HTML_UI = r"""<!DOCTYPE html>
       <div><label>推送 / 接收</label><div id="counts">-</div></div>
       <div><label>最近接收</label><div id="lastRecv">-</div></div>
     </div>
+  </section>
+
+  <section class="card">
+    <h2>监听地址与端口 <span class="tag" id="netTag">-</span></h2>
+    <div class="netrow">
+      <label>监听地址（0.0.0.0 = 所有网卡）
+        <input id="nb" list="ipList" placeholder="0.0.0.0">
+      </label>
+      <label>端口
+        <input id="np" inputmode="numeric" placeholder="8765">
+      </label>
+    </div>
+    <div class="netrow one">
+      <label>对外公布的地址（写进配对链接；留空=自动取本机 IP）
+        <input id="na" list="ipList" placeholder="自动">
+      </label>
+    </div>
+    <datalist id="ipList"></datalist>
+    <label class="switch"><input type="checkbox" id="swPortAuto" onchange="null"> 端口被占用时自动换一个空闲端口</label>
+    <div class="row">
+      <button class="primary" onclick="saveNet()">保存并应用</button>
+      <button onclick="loadNet()">重新读取</button>
+    </div>
+    <p class="hint">保存后立即换端口，无需重启。改了端口或公布地址后配对链接会变，需要把新链接重新发给对方绑定一次。</p>
   </section>
 
   <section class="card">
@@ -148,8 +178,11 @@ async function api(path, body){
     opt.body=JSON.stringify(body);
   }
   const r = await fetch(path, opt);
-  if (!r.ok) throw new Error('HTTP ' + r.status);
-  return r.json();
+  if (r.status === 401) throw new Error('未授权');
+  let data = {};
+  try { data = await r.json(); } catch(e) { throw new Error('HTTP ' + r.status); }
+  if (!r.ok && data.ok !== false) throw new Error('HTTP ' + r.status);
+  return data;
 }
 
 function fmtTime(ts){
@@ -162,7 +195,8 @@ async function refresh(){
   try{
     const s = await api('/api/status');
     document.getElementById('hostname').textContent = s.name + ' · v' + s.version;
-    document.getElementById('listen').textContent = s.bind;
+    document.getElementById('listen').textContent = s.listen
+      ? (s.listen[0] + ':' + s.listen[1]) : s.bind;
     document.getElementById('peersCount').textContent = s.peers.length + ' 个';
     document.getElementById('counts').textContent = s.push_count + ' / ' + s.recv_count;
     document.getElementById('lastRecv').textContent = fmtTime(s.last_recv_at);
@@ -196,6 +230,43 @@ async function refresh(){
     document.getElementById('state').textContent='连接失败';
     document.getElementById('state').className='badge off';
   }
+}
+
+async function loadNet(){
+  try{
+    const n = await api('/api/network');
+    const ae = document.activeElement;
+    const editing = ae && ['nb','np','na'].indexOf(ae.id) >= 0;
+    if (!editing){
+      document.getElementById('nb').value = n.bind || '0.0.0.0';
+      document.getElementById('np').value = n.port;
+      document.getElementById('na').value = n.advertise || '';
+      document.getElementById('swPortAuto').checked = !!n.port_auto;
+    }
+    const opts = ['0.0.0.0'].concat(n.candidates || []);
+    document.getElementById('ipList').innerHTML =
+      [...new Set(opts)].map(v=>'<option value="'+v+'">').join('');
+    const tag = document.getElementById('netTag');
+    tag.textContent = n.listen ? ('实际监听 ' + n.listen[0] + ':' + n.listen[1]) : '未监听';
+  }catch(e){ /* 轮询失败时静默 */ }
+}
+
+async function saveNet(){
+  const bind = document.getElementById('nb').value.trim() || '0.0.0.0';
+  const port = parseInt(document.getElementById('np').value.trim(), 10);
+  const advertise = document.getElementById('na').value.trim();
+  const portAuto = document.getElementById('swPortAuto').checked;
+  if (!port || port < 1 || port > 65535) return toast('端口要填 1-65535');
+  try{
+    const r = await api('/api/network', {bind, port, advertise, port_auto: portAuto});
+    if (!r.ok){ toast('保存失败：' + (r.error || '未知错误')); loadNet(); return; }
+    toast('已生效：' + r.bind + ':' + r.port);
+    if (r.moved && r.ui_url){
+      setTimeout(()=>{ location.href = r.ui_url; }, 700);
+      return;
+    }
+    refresh(); loadNet();
+  }catch(e){ toast('保存失败：' + e.message); }
 }
 
 async function copyLink(){
@@ -261,8 +332,10 @@ async function loadLog(){
 
 refresh();
 loadLog();
+loadNet();
 setInterval(refresh, 3000);
 setInterval(loadLog, 3000);
+setInterval(loadNet, 6000);
 </script>
 </body>
 </html>

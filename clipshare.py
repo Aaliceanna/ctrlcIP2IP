@@ -46,7 +46,7 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -278,6 +278,8 @@ def default_config() -> dict:
         "name": socket.gethostname(),
         "bind": "0.0.0.0",   # 监听地址；可指定具体 IP，如 192.168.2.65
         "port": 8765,
+        "advertise": "",      # 对外公布地址（写进配对链接）；留空=自动取本机 IP
+        "port_auto": True,    # 端口被占用时自动改用其它空闲端口
         "token": secrets.token_hex(16),
         "peers": [],          # [{"name","host","port","token"}]
         "max_kb": 512,
@@ -310,6 +312,14 @@ def load_config() -> dict:
     cfg["poll_ms"] = max(50, int(cfg["poll_ms"]))
     for p in cfg.get("peers") or []:
         p["port"] = int(p.get("port") or 8765)
+    # 监听地址 / 对外公布地址：统一规整，避免空串或 "auto" 导致链接异常
+    cfg["bind"] = str(cfg.get("bind") or "0.0.0.0").strip() or "0.0.0.0"
+    adv = str(cfg.get("advertise") or "").strip()
+    cfg["advertise"] = "" if adv.lower() in ("auto", "自动") else adv
+    cfg["port_auto"] = bool(cfg.get("port_auto", True))
+    if not (1 <= cfg["port"] <= 65535):
+        cfg["port"] = 8765
+        changed = True
     if changed:
         save_config(cfg)
     return cfg
@@ -645,7 +655,29 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, self._status())
         if path.path == "/api/mylink":
             return self._json(
-                200, {"ok": True, "link": build_link(CORE.cfg, local_ip())}
+                200,
+                {
+                    "ok": True,
+                    "link": build_link(CORE.cfg),
+                    "host": advertise_host(CORE.cfg),
+                    "port": CORE.cfg["port"],
+                },
+            )
+        if path.path == "/api/network":
+            cfg = CORE.cfg
+            return self._json(
+                200,
+                {
+                    "ok": True,
+                    "bind": cfg["bind"],
+                    "port": int(cfg["port"]),
+                    "advertise": cfg.get("advertise", ""),
+                    "port_auto": bool(cfg.get("port_auto", True)),
+                    "auto_host": advertise_host({"advertise": ""}),
+                    "candidates": local_ipv4_list(),
+                    "listen": list(SERVER.server_address[:2]) if SERVER else None,
+                    "link": build_link(cfg),
+                },
             )
         if path.path == "/api/log":
             qs = urllib.parse.parse_qs(path.query)
@@ -664,6 +696,8 @@ class Handler(BaseHTTPRequestHandler):
                         "name": cfg["name"],
                         "bind": cfg["bind"],
                         "port": cfg["port"],
+                        "advertise": cfg.get("advertise", ""),
+                        "port_auto": bool(cfg.get("port_auto", True)),
                         "max_kb": cfg["max_kb"],
                         "poll_ms": cfg["poll_ms"],
                         "log_level": cfg.get("log_level", "info"),
@@ -778,6 +812,27 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
 
+        if path == "/api/network":
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            try:
+                bind = validate_bind(str(body.get("bind", CORE.cfg["bind"])))
+            except ValueError as exc:
+                return self._json(400, {"ok": False, "error": str(exc)})
+            try:
+                port = int(body.get("port", CORE.cfg["port"]))
+            except (TypeError, ValueError):
+                return self._json(400, {"ok": False, "error": "端口必须是数字"})
+            if not (1 <= port <= 65535):
+                return self._json(400, {"ok": False, "error": "端口范围 1-65535"})
+            advertise = str(body.get("advertise", CORE.cfg.get("advertise", "")) or "").strip()
+            if advertise.lower() in ("auto", "自动"):
+                advertise = ""
+            port_auto = bool(body.get("port_auto", CORE.cfg.get("port_auto", True)))
+            res = rebind_service(bind, port, advertise, port_auto)
+            return self._json(200 if res.get("ok") else 409, res)
+
         if path == "/api/reload":
             ok = CORE.reload()
             return self._json(200, {"ok": ok, "peers": len(CORE.cfg.get("peers") or [])})
@@ -794,6 +849,10 @@ class Handler(BaseHTTPRequestHandler):
             "name": cfg["name"],
             "version": VERSION,
             "bind": f"{cfg['bind']}:{cfg['port']}",
+            "port": int(cfg["port"]),
+            "advertise": cfg.get("advertise", ""),
+            "port_auto": bool(cfg.get("port_auto", True)),
+            "link": build_link(cfg),
             "listen": SERVER.server_address[:2] if SERVER else None,
             "uptime_s": int(time.time() - CORE.started_at),
             "paused": bool(CORE.paused),
@@ -867,6 +926,117 @@ def local_service_addr(cfg: dict) -> str:
     return b
 
 
+def ip_rank(ip: str) -> int | None:
+    """本机 IPv4 的可用于对外的优先级，越小越优先；None 表示不适合写进链接。
+
+    会排除回环、链路本地，以及 Clash TUN / WireGuard 这类虚拟网卡
+    （198.18.0.0/15 是 Clash TUN、100.64/10 是运营商级 NAT），
+    否则自动生成的链接会指向一个对端根本连不上的地址。
+    """
+    try:
+        a, b = (int(x) for x in str(ip).split(".")[:2])
+    except Exception:
+        return None
+    if a in (0, 127):
+        return None
+    if a == 169 and b == 254:
+        return None
+    if a == 198 and b in (18, 19):
+        return None
+    if a == 100 and 64 <= b <= 127:
+        return None
+    if a == 192 and b == 168:
+        return 0
+    if a == 10:
+        return 1
+    if a == 172 and 16 <= b <= 31:
+        return 2
+    return 5
+
+
+def local_ipv4_list() -> list[str]:
+    """本机可用于对外的 IPv4，按优先级排序（去掉回环与虚拟网卡）。"""
+    found: list[str] = []
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            s.connect(("8.8.8.8", 80))
+            found.append(s.getsockname()[0])
+        finally:
+            s.close()
+    except Exception:
+        pass
+    try:
+        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
+            found.append(info[4][0])
+    except Exception:
+        pass
+    seen: list[str] = []
+    for ip in found:
+        if ip and ip not in seen and ip_rank(ip) is not None:
+            seen.append(ip)
+    return sorted(seen, key=lambda ip: ip_rank(ip) or 99)
+
+
+def can_bind(bind: str, port: int) -> bool:
+    """快速探测某地址端口能否绑定（不做监听，仅占用测试）。"""
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    if os.name != "nt":
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        s.bind((bind, int(port)))
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            s.close()
+        except Exception:
+            pass
+
+
+def pick_free_port(bind: str, start: int, span: int = 40) -> int | None:
+    """从 start 开始找一个能绑定的端口；找不到就让系统随机分配一个。"""
+    start = max(1, int(start))
+    for port in range(start, min(65535, start + span) + 1):
+        if can_bind(bind, port):
+            return port
+    try:
+        s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        try:
+            s.bind((bind, 0))
+            return int(s.getsockname()[1])
+        finally:
+            s.close()
+    except OSError:
+        return None
+
+
+def validate_bind(value: str) -> str:
+    """校验监听地址：空 → 0.0.0.0；否则必须是本机可绑定的 IPv4 / localhost。"""
+    v = (value or "").strip()
+    if v in ("", "*", "all", "全部"):
+        return "0.0.0.0"
+    if v in ("localhost", "127.0.0.1") or v == "0.0.0.0":
+        return v
+    if not re.fullmatch(r"\d{1,3}(?:\.\d{1,3}){3}", v):
+        raise ValueError("监听地址要填 IPv4，如 0.0.0.0 / 192.168.2.65")
+    if not can_bind(v, 0):
+        raise ValueError(f"{v} 不是本机地址，无法监听")
+    return v
+
+
+def advertise_host(cfg: dict) -> str:
+    """生成配对链接时使用的地址：优先用户指定，否则取本机最像局域网的那个 IP。"""
+    adv = str(cfg.get("advertise") or "").strip()
+    if adv:
+        return adv
+    ips = local_ipv4_list()
+    if ips:
+        return ips[0]
+    return local_ip()
+
+
 def service_call(cfg: dict, path: str, payload=None, timeout: float = 5.0):
     url = f"http://{host_for_url(local_service_addr(cfg))}:{cfg['port']}{path}"
     return http_json(url, payload, token=cfg["token"], timeout=timeout)
@@ -898,7 +1068,8 @@ LINK_RE = re.compile(
 )
 
 
-def build_link(cfg: dict, host: str) -> str:
+def build_link(cfg: dict, host: str | None = None) -> str:
+    host = host or advertise_host(cfg)
     q = urllib.parse.urlencode({"name": cfg["name"]})
     return f"clipshare://{host_for_url(host)}:{cfg['port']}/{cfg['token']}?{q}"
 
@@ -1195,8 +1366,11 @@ def cmd_start(cfg: dict) -> int:
     spawn_background()
     for _ in range(40):
         time.sleep(0.25)
-        if service_alive(cfg):
-            print(f"已启动：{cfg['bind']}:{cfg['port']}  名称={cfg['name']}")
+        live = load_config()  # 子进程可能因为端口被占用自动换了端口，要以磁盘上的为准
+        if service_alive(live):
+            print(f"已启动：{live['bind']}:{live['port']}  名称={live['name']}")
+            if int(live["port"]) != int(cfg["port"]):
+                print(f"注意：端口 {cfg['port']} 被占用，已自动改用 {live['port']}")
             return 0
     print("启动失败或超时，请查看日志：", LOG_PATH)
     return 1
@@ -1208,36 +1382,36 @@ def cmd_start(cfg: dict) -> int:
 def cmd_run(args, cfg: dict) -> int:
     global CORE, SERVER
     clipboard()  # 平台不支持时在这里给出明确提示
+    try:
+        SERVER, port, note = bind_with_fallback(cfg)
+    except OSError as exc:
+        log.error("监听 %s:%s 失败: %s（端口被占用，或服务已在运行）", cfg["bind"], cfg["port"], exc)
+        if not args.silent:
+            print(f"监听 {cfg['bind']}:{cfg['port']} 失败：{exc}")
+            if cfg.get("port_auto", True):
+                print("可换端口：clipshare-cli.exe config --port 8899，或在设置面板改监听地址/端口")
+        return 2
     CORE = Core(cfg)
     CORE.pusher.start()
     threading.Thread(target=poller_loop, args=(CORE,), daemon=True, name="poller").start()
 
-    from http.server import ThreadingHTTPServer as _THS
-
-    _THS.daemon_threads = True
-    _THS.allow_reuse_address = os.name != "nt"  # Windows 上会允许端口重复绑定，必须关闭
-    try:
-        SERVER = _THS((cfg["bind"], cfg["port"]), Handler)
-    except OSError as exc:
-        log.error("监听 %s:%s 失败: %s（端口被占用，或服务已在运行）", cfg["bind"], cfg["port"], exc)
-        if not args.silent:
-            print(f"端口 {cfg['port']} 不可用：{exc}")
-        return 2
+    if note and not args.silent:
+        print(note)
 
     log.info("ClipShare %s 已启动  监听=%s:%s  名称=%s  对端=%d",
-             VERSION, cfg["bind"], cfg["port"], cfg["name"], len(cfg.get("peers") or []))
+             VERSION, cfg["bind"], port, cfg["name"], len(cfg.get("peers") or []))
     if not args.silent:
         print(f"监听 {cfg['bind']}:{cfg['port']}  对端 {len(cfg.get('peers') or [])} 个  Ctrl+C 退出")
+    # 服务循环放后台线程：这样运行中换监听地址/端口不会导致进程退出
+    _serve_in_background(SERVER)
     try:
-        SERVER.serve_forever(poll_interval=0.4)
+        while not CORE.stop_event.wait(0.5):
+            pass
     except KeyboardInterrupt:
         pass
     finally:
         CORE.stop_event.set()
-        try:
-            SERVER.server_close()
-        except Exception:
-            pass
+        _stop_server(SERVER)
         log.info("已停止")
     return 0
 
@@ -1276,21 +1450,165 @@ def fatal(msg: str) -> None:
     print(msg, file=sys.stderr)
 
 
+def _new_http_server(bind: str, port: int):
+    ThreadingHTTPServer.daemon_threads = True
+    # Windows 上 SO_REUSEADDR 允许两个进程绑定同一端口（请求被随机劫持），必须关闭
+    ThreadingHTTPServer.allow_reuse_address = os.name != "nt"
+    return ThreadingHTTPServer((bind, int(port)), Handler)
+
+
+def bind_with_fallback(cfg: dict, strict: bool = False):
+    """按配置绑定监听。端口被占用且允许自动避让时，自动换一个空闲端口。
+
+    返回 (server, port, note)；note 非空表示发生了自动改端口。
+    """
+    bind, want = cfg["bind"], int(cfg["port"])
+    try:
+        return _new_http_server(bind, want), want, ""
+    except OSError as exc:
+        if strict or not cfg.get("port_auto", True):
+            raise
+        alt = pick_free_port(bind, want + 1, 60)
+        if not alt:
+            raise
+        try:
+            srv = _new_http_server(bind, alt)
+        except OSError:
+            raise exc
+        note = f"端口 {want} 被占用（{getattr(exc, 'strerror', None) or exc}），已自动改用 {alt}"
+        log.warning(note)
+        cfg["port"] = int(alt)
+        save_config(cfg)
+        return srv, int(alt), note
+
+
 def _start_service(cfg: dict):
     """初始化核心与 HTTP 服务（托盘 / 无界面共用）。"""
     global CORE, SERVER
     clipboard()
+    SERVER, port, note = bind_with_fallback(cfg)
     CORE = Core(cfg)
     CORE.pusher.start()
     threading.Thread(target=poller_loop, args=(CORE,), daemon=True, name="poller").start()
-    ThreadingHTTPServer.daemon_threads = True
-    # Windows 上 SO_REUSEADDR 允许两个进程绑定同一端口（请求被随机劫持），必须关闭
-    ThreadingHTTPServer.allow_reuse_address = os.name != "nt"
-    SERVER = ThreadingHTTPServer((cfg["bind"], cfg["port"]), Handler)
     threading.Thread(
         target=SERVER.serve_forever, kwargs={"poll_interval": 0.4}, daemon=True, name="http"
     ).start()
+    if note:
+        CORE.port_note = note
     return CORE, SERVER
+
+
+_REBIND_LOCK = threading.Lock()
+
+
+def _serve_in_background(srv) -> None:
+    threading.Thread(
+        target=srv.serve_forever, kwargs={"poll_interval": 0.4},
+        daemon=True, name="http",
+    ).start()
+
+
+def _stop_server(srv) -> None:
+    if srv is None:
+        return
+    try:
+        srv.shutdown()
+    except Exception:
+        pass
+    try:
+        srv.server_close()
+    except Exception:
+        pass
+
+
+def _rebind_fail(bind: str, port: int, old_bind: str, old_port: int, exc) -> dict:
+    """新地址绑不上：尝试把旧地址恢复回来，保证服务不中断。"""
+    global SERVER
+    reason = getattr(exc, "strerror", None) or str(exc)
+    rolled = False
+    try:
+        srv = _new_http_server(old_bind, old_port)
+        SERVER = srv
+        _serve_in_background(srv)
+        rolled = True
+        log.warning("切换监听 %s:%s 失败（%s），已回滚到 %s:%s",
+                    bind, port, reason, old_bind, old_port)
+    except Exception as exc2:
+        SERVER = None
+        log.error("回滚到 %s:%s 也失败：%s", old_bind, old_port, exc2)
+    return {
+        "ok": False,
+        "error": f"无法监听 {bind}:{port} —— {reason}",
+        "rolled_back": rolled,
+        "bind": old_bind if rolled else None,
+        "port": old_port if rolled else None,
+    }
+
+
+def rebind_service(bind: str, port: int, advertise: str = "",
+                   port_auto: bool | None = None) -> dict:
+    """运行中切换监听地址/端口；新地址不可用时自动回滚，不会把服务弄挂。
+
+    - 只换了端口：先建立新监听再关旧的，切换过程零中断
+    - 只换了地址（端口不变）：必须先关旧的才能绑新的，失败则回滚
+    """
+    global SERVER
+    if CORE is None:
+        return {"ok": False, "error": "服务未运行"}
+    old = dict(CORE.cfg)
+    old_bind, old_port = old["bind"], int(old["port"])
+    same = (bind == old_bind and int(port) == old_port)
+
+    with _REBIND_LOCK:
+        if not same:
+            old_srv = SERVER
+            if int(port) != old_port:
+                # 端口变了，新旧可以并存 → 先起新的，再关旧的（切换零中断）
+                try:
+                    new_srv = _new_http_server(bind, port)
+                except OSError as exc:
+                    # 旧监听完全没动过，什么都不用回滚
+                    reason = getattr(exc, "strerror", None) or str(exc)
+                    log.warning("切换监听 %s:%s 失败（%s），旧监听 %s:%s 保持不变",
+                                bind, port, reason, old_bind, old_port)
+                    return {
+                        "ok": False,
+                        "error": f"无法监听 {bind}:{port} —— {reason}",
+                        "rolled_back": True,
+                        "bind": old_bind,
+                        "port": old_port,
+                    }
+                SERVER = new_srv
+                _serve_in_background(new_srv)
+                _stop_server(old_srv)
+            else:
+                # 同端口换地址，只能先进退：先关旧的才能绑新的
+                _stop_server(old_srv)
+                try:
+                    new_srv = _new_http_server(bind, port)
+                except OSError as exc:
+                    return _rebind_fail(bind, port, old_bind, old_port, exc)
+                SERVER = new_srv
+                _serve_in_background(new_srv)
+
+        cfg = CORE.cfg
+        cfg["bind"] = bind
+        cfg["port"] = int(port)
+        cfg["advertise"] = advertise
+        if port_auto is not None:
+            cfg["port_auto"] = bool(port_auto)
+        save_config(cfg)
+        log.info("监听已更新为 %s:%s，对外公布 %s", bind, port, advertise_host(cfg))
+        return {
+            "ok": True,
+            "bind": bind,
+            "port": int(port),
+            "advertise": cfg.get("advertise", ""),
+            "port_auto": bool(cfg.get("port_auto", True)),
+            "link": build_link(cfg),
+            "ui_url": ui_url(cfg),
+            "moved": not same,
+        }
 
 
 # ---- 托盘动作 ----
@@ -1317,7 +1635,7 @@ def _toggle_autostart() -> None:
 
 
 def _copy_my_link() -> str:
-    link = build_link(CORE.cfg, local_ip())
+    link = build_link(CORE.cfg)
     try:
         clipboard().write(link)
     except Exception:
@@ -1347,7 +1665,13 @@ def cmd_gui(args, cfg: dict) -> int:
     try:
         core, server = _start_service(cfg)
     except OSError as exc:
-        fatal(f"端口 {cfg['port']} 无法监听：{exc}\n可能已有另一个 ClipShare 实例在运行。")
+        fatal(
+            f"无法监听 {cfg['bind']}:{cfg['port']}：{exc}\n\n"
+            "常见原因：端口被其它程序占用，或填的这个 IP 不在本机网卡上。\n"
+            "解决办法：在设置面板的「监听地址与端口」里改一个，或勾上"
+            "“端口被占用时自动换一个可用端口”。\n"
+            f"配置文件：{CONFIG_PATH}"
+        )
         return 2
 
     log.info(
@@ -1380,8 +1704,9 @@ def cmd_gui(args, cfg: dict) -> int:
     hooks = {
         "title": lambda: f"ClipShare · {CORE.cfg['name']}",
         "status": lambda: (
-            f"已绑定 {len(CORE.cfg.get('peers') or [])} 个对端"
-            + ("（同步已暂停）" if CORE.paused else "")
+            f"监听 {CORE.cfg['bind']}:{CORE.cfg['port']}"
+            f" · 对端 {len(CORE.cfg.get('peers') or [])} 个"
+            + ("（已暂停）" if CORE.paused else "")
         ),
         "open_ui": lambda: open_settings(CORE.cfg),
         "paused": lambda: CORE.paused,
@@ -1441,6 +1766,8 @@ def cmd_status(args, cfg: dict) -> int:
         print(json.dumps(st, ensure_ascii=False, indent=2))
         return 0
     print(f"服务：运行中  {st['name']}  v{st['version']}  监听 {st['bind']}  已运行 {st['uptime_s']}s")
+    if st.get("link"):
+        print(f"配对链接：{st['link']}")
     print(f"自启：{'已安装' if autostart_installed() else '未安装'}    推送 {st['push_count']} 次 / 接收 {st['recv_count']} 次")
     if st["last_push_at"]:
         print(f"最近推送：{time.strftime('%H:%M:%S', time.localtime(st['last_push_at']))}")
@@ -1473,10 +1800,12 @@ def cmd_link(args, cfg: dict) -> int:
             print("无法获取公网 IP（可能被墙或离线）。可手动指定：link --host 1.2.3.4")
             return 1
     else:
-        host = local_ip()
+        host = advertise_host(cfg)
     link = build_link(cfg, host)
-    print(f"局域网 IP : {local_ip()}")
-    if args.wan or args.host:
+    ips = local_ipv4_list()
+    print(f"本机 IP   : {', '.join(ips) if ips else local_ip()}")
+    print(f"监听      : {cfg['bind']}:{cfg['port']}")
+    if args.wan or args.host or cfg.get("advertise"):
         print(f"使用地址 : {host}")
     print(f"配对链接 : {link}")
     if args.wan:
@@ -1577,9 +1906,16 @@ def cmd_send(args, cfg: dict) -> int:
 
 def cmd_install(args, cfg: dict) -> int:
     if args.bind:
-        cfg["bind"] = args.bind
+        try:
+            cfg["bind"] = validate_bind(args.bind)
+        except ValueError as exc:
+            print(exc)
+            return 2
     if args.port:
         cfg["port"] = int(args.port)
+    if getattr(args, "advertise", None) is not None:
+        adv = args.advertise.strip()
+        cfg["advertise"] = "" if adv.lower() in ("auto", "自动") else adv
     if args.name:
         cfg["name"] = args.name
     save_config(cfg)
@@ -1602,14 +1938,34 @@ def cmd_uninstall(args, cfg: dict) -> int:
 
 def cmd_config(args, cfg: dict) -> int:
     dirty = False
+    net_changed = False
+    probe = {"bind": cfg["bind"], "port": int(cfg["port"]), "token": cfg["token"]}
     if args.bind:
-        cfg["bind"] = args.bind
+        stamp = str(cfg["bind"])
+        try:
+            cfg["bind"] = validate_bind(args.bind)
+        except ValueError as exc:
+            print(exc)
+            return 2
+        net_changed = net_changed or cfg["bind"] != stamp
         dirty = True
     if args.port:
-        cfg["port"] = int(args.port)
+        new_port = int(args.port)
+        if not (1 <= new_port <= 65535):
+            print("端口范围 1-65535")
+            return 2
+        net_changed = net_changed or new_port != int(cfg["port"])
+        cfg["port"] = new_port
         dirty = True
     if args.name:
         cfg["name"] = args.name
+        dirty = True
+    if getattr(args, "advertise", None) is not None:
+        adv = args.advertise.strip()
+        cfg["advertise"] = "" if adv.lower() in ("auto", "自动") else adv
+        dirty = True
+    if getattr(args, "port_auto", None) is not None:
+        cfg["port_auto"] = bool(args.port_auto)
         dirty = True
     if args.max_kb:
         cfg["max_kb"] = int(args.max_kb)
@@ -1622,13 +1978,36 @@ def cmd_config(args, cfg: dict) -> int:
         dirty = True
         print("已生成新令牌 —— 所有对端需重新 bind")
     if dirty:
-        save_config(cfg)
-        if args.new_token:
-            print("配置已保存 —— 令牌已变更，必须执行 restart 才对端生效")
-        elif notify_reload(cfg):
-            print("配置已保存并热加载")
+        if net_changed and not args.new_token and service_alive(probe):
+            # 服务在跑：直接调接口热切换监听，不用重启
+            try:
+                _, res = service_call(
+                    probe,
+                    "/api/network",
+                    {
+                        "bind": cfg["bind"],
+                        "port": int(cfg["port"]),
+                        "advertise": cfg.get("advertise", ""),
+                        "port_auto": bool(cfg.get("port_auto", True)),
+                    },
+                    timeout=20,
+                )
+            except Exception as exc:
+                res = {"ok": False, "error": str(exc)}
+            if res.get("ok"):
+                print(f"监听已切换为 {res['bind']}:{res['port']}（已生效，无需重启）")
+                print(f"新配对链接：{res.get('link', '')}")
+            else:
+                print(f"切换监听失败：{res.get('error')}（配置保持原样）")
+                return 1
         else:
-            print("配置已保存；服务未运行或需 restart")
+            save_config(cfg)
+            if args.new_token:
+                print("配置已保存 —— 令牌已变更，必须执行 restart 才对端生效")
+            elif notify_reload(cfg):
+                print("配置已保存并热加载")
+            else:
+                print("配置已保存；服务未运行或需 restart")
     print(json.dumps({k: v for k, v in cfg.items() if k != "token"}, ensure_ascii=False, indent=2))
     print(f"配置文件：{CONFIG_PATH}")
     return 0
@@ -1694,14 +2073,20 @@ def build_parser() -> argparse.ArgumentParser:
     s = sub.add_parser("install", help="安装开机自启并启动")
     s.add_argument("--bind", help="监听地址，如 192.168.2.65 或 0.0.0.0")
     s.add_argument("--port", type=int)
+    s.add_argument("--advertise", help="写进配对链接的地址；传 auto 表示自动")
     s.add_argument("--name")
     s.set_defaults(fn=cmd_install)
 
     sub.add_parser("uninstall", help="移除开机自启").set_defaults(fn=cmd_uninstall)
 
     s = sub.add_parser("config", help="查看/修改配置")
-    s.add_argument("--bind")
-    s.add_argument("--port", type=int)
+    s.add_argument("--bind", help="监听地址：0.0.0.0=所有网卡，或指定本机 IP")
+    s.add_argument("--port", type=int, help="监听端口，默认 8765")
+    s.add_argument("--advertise", help="写进配对链接的地址（IP 或 DDNS）；传 auto 表示自动")
+    s.add_argument("--port-auto", dest="port_auto", action="store_true",
+                   default=None, help="端口被占用时自动换端口")
+    s.add_argument("--no-port-auto", dest="port_auto", action="store_false",
+                   help="端口被占用时直接报错，不自动换")
     s.add_argument("--name")
     s.add_argument("--max-kb", dest="max_kb", type=int)
     s.add_argument("--poll-ms", dest="poll_ms", type=int)
