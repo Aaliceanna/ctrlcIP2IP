@@ -2,7 +2,10 @@ __pycache__/
 *.py[cod]
 build/
 dist/
+out/
 *.spec
+*.zip
+*.tar.gz
 .test/
 .smoke/
 .venv/
