@@ -54,7 +54,7 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
