@@ -13,3 +13,4 @@ release/
 *.log
 config.json
 dist-new/
+dist-fix/

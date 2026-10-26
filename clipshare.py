@@ -54,7 +54,7 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -2011,6 +2011,8 @@ def handshake(peer: dict, timeout: float = 4.0) -> tuple[bool, str]:
 # firewall.json。下次启动（含闪退后重启）先按 PID 存活情况回收孤儿规则，
 # 再兜底扫描同前缀但无记录的规则删除，保证不会在防火墙里留下洞口。
 FW_PREFIX = "ClipShare"
+# 规则描述：不含空格，这样非提权的 _sh 提权版 cmd 拼接都能直接用
+FW_DESC = "ClipShare-temp-allow"
 FW_STATE_PATH = os.path.join(HOME, "firewall.json")
 FW_LOCK = threading.RLock()
 FW_MANAGED: dict = {}          # port -> entry（本进程开过的规则）
@@ -2138,31 +2140,127 @@ def _win_has_admin() -> bool:
         return False
 
 
-def _win_elevate(params: str) -> bool:
-    """用 ShellExecute(runas) 弹出 UAC，请求管理员执行一条内部命令。"""
-    exe = sys.executable
-    args = params
-    if not is_frozen():
-        args = f'"{os.path.abspath(__file__)}" {params}'
-    try:
-        rc = ctypes.windll.shell32.ShellExecuteW(None, "runas", exe, args, None, 1)
-        return int(rc) > 32
-    except Exception:
+def _win_elevate_netsh(cmds: list[str], bat: str = "", wait: bool = True) -> bool:
+    """提权执行若干条 netsh 命令（或一个批处理），只弹一次 UAC。
+
+    cmds 是拼好的 netsh 命令行片段（不含 `netsh` 本身），例如
+    `advfirewall firewall add rule name=... dir=in ...`；传 bat 时改为执行该脚本。
+    wait=False 时把整个提权动作丢到后台线程 —— 守护脚本是长期运行的，
+    ShellExecuteW 会一直等到它结束才返回，同步调用会把 GUI 线程卡死。
+
+    为什么不再「提权重启自己」：onefile 打包的程序每次启动都要把十几 MB 的包
+    解压到临时目录。用 `ShellExecute(runas, sys.executable, ...)` 拉起自身时，
+    子进程会继承父进程的 `_PYI_APPLICATION_HOME_DIR` 等变量、去复用父进程仍在
+    使用的解压目录，解压 DLL 时被拒，直接死在
+    `failed to extract PIL\\_avif.cp313-win_amd64.pyd: decompression resulted in
+    return code -1`，UAC 点了「是」也放行失败。改成提权调用系统命令 netsh，
+    提权进程里根本没有 Python，也就不会解压、不会撞锁，还快得多。
+    """
+    if not IS_WIN:
         return False
+    if bat:
+        target, params = "cmd.exe", f'/c "{bat}"'
+    elif cmds:
+        target, params = "cmd.exe", "/c " + " & ".join(f"netsh {c}" for c in cmds)
+    else:
+        return False
+    if not wait:
+        threading.Thread(
+            target=_win_shell_runas, args=(target, params), daemon=True, name="fw-elevate",
+        ).start()
+        return True  # 异步：调用方靠 _wait_elevated_rule 轮询规则是否出现
+    return _win_shell_runas(target, params)
+
+
+def _win_shell_runas(target: str, params: str) -> bool:
+    try:
+        rc = int(ctypes.windll.shell32.ShellExecuteW(None, "runas", target, params, None, 0))
+    except Exception as exc:
+        log.debug("提权执行失败: %s", exc)
+        return False
+    if rc <= 32:
+        if rc == 5:
+            log.info("已取消管理员授权（UAC 点了“否”）")
+        else:
+            log.warning("请求管理员权限失败，ShellExecute 返回 %s", rc)
+        return False
+    return True
+
+
+def _win_netsh_add(port: int, name: str) -> str:
+    # 这条会被拼进 `cmd.exe /c netsh ...`，所以 description 不能用空格带引号
+    return (f"advfirewall firewall add rule name={name} dir=in action=allow "
+            f"protocol=TCP localport={int(port)} profile=any enable=yes "
+            f"description={FW_DESC}")
+
+
+def _win_netsh_del(name: str) -> str:
+    return f"advfirewall firewall delete rule name={name}"
 
 
 def _win_rule_add(name: str, port: int) -> tuple[bool, str]:
+    """有管理员权限时直接加规则（参数列表形式，最稳）。"""
     rc, out = _sh(
         [
             "netsh", "advfirewall", "firewall", "add", "rule",
             f"name={name}", "dir=in", "action=allow", "protocol=TCP",
             f"localport={int(port)}", "profile=any", "enable=yes",
-            f"description={FW_PREFIX} temp allow TCP {int(port)}",
+            f"description={FW_DESC}",
         ]
     )
     if rc == 0:
         return True, out
     return False, out or f"netsh 退出码 {rc}"
+
+
+def _win_elevate_open(port: int, name: str, persist: bool, owner_pid: int) -> bool:
+    """提权加规则；临时规则模式下由提权进程守着，父进程一退出就自己删掉。
+
+    为什么临时模式要守：管理员创建的规则，普通权限的 ClipShare 进程**删不掉**
+    （netsh 返回“请求的操作需要提升”）。若只在退出时再弹一次 UAC 去删，用户点了
+    “否”规则就永久残留，说好的“临时放行”就不成立。挂一个等待父进程退出的循环后，
+    正常退出 / 崩溃 / 被强杀都能还原，而且全程只弹一次 UAC。
+
+    两个实测坑：
+    1. 必须写成真正的 .bat 再执行。`cmd /c "a & :tag & goto x & :x"` 这种单行
+       拼接里 **goto 的标签不生效**，会在 goto 处直接结束，守候逻辑静默失效。
+    2. 守护脚本是长期运行的，ShellExecuteW 会等它结束才返回，所以必须异步启动，
+       否则界面线程会被卡住。
+    """
+    if persist:
+        return _win_elevate_netsh([_win_netsh_add(port, name)])
+
+    tag = f"{int(port)}-{int(owner_pid)}"
+    # 放在系统临时目录：守护脚本可能存活到本程序退出之后，别放在会被清理的 HOME 下
+    tmpdir = os.environ.get("TEMP") or tempfile.gettempdir()
+    probe = os.path.join(tmpdir, f"cs-fw-{tag}.tmp")
+    bat = os.path.join(tmpdir, f"cs-fw-guard-{tag}.bat")
+    lines = [
+        "@echo off",
+        "chcp 65001 >nul",
+        # 先删同名残留，避免历史规则导致 add 失败
+        f"netsh {_win_netsh_del(name)} >nul 2>&1",
+        f"netsh {_win_netsh_add(port, name)}",
+        "if errorlevel 1 goto cleanup",
+        ":wait",
+        f'tasklist /FI "PID eq {int(owner_pid)}" /NH > "{probe}" 2>&1',
+        f'findstr /C:"{int(owner_pid)}" "{probe}" >nul',
+        "if errorlevel 1 goto unblock",
+        "ping -n 3 127.0.0.1 >nul",
+        "goto wait",
+        ":unblock",
+        f"netsh {_win_netsh_del(name)}",
+        ":cleanup",
+        f'del "{probe}" >nul 2>&1',
+        'del "%~f0" >nul 2>&1',
+    ]
+    try:
+        with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
+            f.write("\n".join(lines) + "\n")
+    except Exception as exc:
+        log.debug("写防火墙守护脚本失败: %s", exc)
+        return False
+    return _win_elevate_netsh([], bat=bat, wait=False)
 
 
 def _win_rule_del(name: str) -> tuple[bool, str]:
@@ -2446,16 +2544,20 @@ def fw_open(port: int, mode: str = "temp", elevate: bool = True, pid: int | None
         ok, err = _win_rule_add(name, port)
         if not ok:
             if elevate and not _win_has_admin():
-                if _win_elevate(f"fw --open --port {port} --mode {mode} --pid {os.getpid()}"):
+                # 提权直接跑 netsh，不再重启本程序（会撞 onefile 解压目录）
+                if _win_elevate_open(port, name, mode == "persist", owner):
                     threading.Thread(
-                        target=_wait_elevated_rule, args=(name, port, mode), daemon=True,
+                        target=_wait_elevated_rule,
+                        args=(name, port, mode, mode != "persist"), daemon=True,
                         name="fw-wait",
                     ).start()
                     return {
                         "ok": False, "elevating": True, "port": port, "mode": mode, "rule": name,
                         "error": "已弹出管理员授权窗口，请在 UAC 里点“是”；放行成功后面板会自动刷新",
                     }
-                return {"ok": False, "port": port, "error": "无法请求管理员权限：" + (err or "未知原因")}
+                return {"ok": False, "port": port,
+                        "error": "放行需要管理员权限，但授权请求被取消或失败（UAC 点了“否”，"
+                                 "或系统不允许提权）。可右键“以管理员身份运行”后再试。"}
             return {"ok": False, "port": port, "error": err or "放行失败（netsh 返回非零）"}
     else:
         ok, err = _lin_apply(port, True)
@@ -2468,27 +2570,33 @@ def fw_open(port: int, mode: str = "temp", elevate: bool = True, pid: int | None
     return {"ok": True, "port": port, "mode": mode, "rule": name}
 
 
-def _wait_elevated_rule(name: str, port: int, mode: str) -> None:
-    """等 UAC 子进程把规则写进来（用户点授权的时间不可控，最多等 60 秒）。"""
+def _wait_elevated_rule(name: str, port: int, mode: str, guarded: bool = False) -> None:
+    """等提权进程把规则写进来（用户点授权的时间不可控，最多等 60 秒）。
+
+    guarded=True 表示临时规则已由守护脚本托管：父进程退出后它会自己删规则，
+    所以本地状态里要打上标记，退出时不再重复弹 UAC 去删。
+    """
     for _ in range(60):
         time.sleep(1.0)
         if _win_rule_exists(name):
             entry = {
                 "name": name, "port": int(port), "pid": os.getpid(), "mode": mode,
-                "backend": "netsh", "ts": int(time.time()),
+                "backend": "netsh", "ts": int(time.time()), "guarded": bool(guarded),
             }
             fw_state_upsert(entry)
             FW_MANAGED[int(port)] = entry
             log.info("管理员授权成功，TCP %s 已放行（%s）", port,
-                     "常驻" if mode == "persist" else "临时，退出自动恢复")
+                     "常驻" if mode == "persist" else
+                     ("临时，退出自动恢复" if not guarded else "临时，由守护进程在退出后自动回收"))
             return
     log.warning("等待管理员放行超时（TCP %s）：UAC 可能已被取消", port)
 
 
-def _elevate_fw(params: str) -> bool:
-    if not IS_WIN or _win_has_admin():
+def _elevate_fw(cmds: list[str]) -> bool:
+    """没管理员权限时，提权执行 netsh（不重启自身）。"""
+    if not IS_WIN or _win_has_admin() or not cmds:
         return False
-    return _win_elevate(params)
+    return _win_elevate_netsh(cmds)
 
 
 def fw_close(port: int | None = None) -> dict:
@@ -2498,6 +2606,7 @@ def fw_close(port: int | None = None) -> dict:
     if not targets:
         return {"ok": True, "closed": 0, "error": "", "note": "没有需要恢复的规则"}
     done, errs = 0, []
+    failed: list[dict] = []
     for e in targets:
         ok, err = _rule_del(e)
         if ok:
@@ -2506,13 +2615,17 @@ def fw_close(port: int | None = None) -> dict:
             FW_MANAGED.pop(int(e.get("port") or 0), None)
         else:
             errs.append(f"{e.get('name')}: {err or '失败'}")
+            failed.append(e)
     if done:
         log.info("已恢复 %d 条防火墙放行规则", done)
-    if errs and _elevate_fw("fw --close --all"):
-        return {
-            "ok": True, "closed": done, "elevating": True,
-            "error": "剩余规则需要管理员权限，已弹出授权窗口，点“是”即可恢复",
-        }
+    # 剩下的删不掉（典型原因：规则是管理员建的，当前进程没权限）
+    if failed:
+        cmds = [_win_netsh_del(str(e.get("name") or "")) for e in failed if e.get("name")]
+        if _elevate_fw(cmds):
+            return {
+                "ok": True, "closed": done, "elevating": True,
+                "error": "剩余规则需要管理员权限，已弹出授权窗口，点“是”即可恢复",
+            }
     return {"ok": not errs, "closed": done, "error": "；".join(errs)}
 
 
@@ -2527,6 +2640,13 @@ def fw_cleanup_all(reason: str = "") -> int:
         pid = e.get("pid")
         if pid and int(pid) != os.getpid() and _pid_alive(pid):
             continue  # 另一个 ClipShare 实例还在用，别动
+        if e.get("guarded"):
+            # 这条规则由提权守护脚本托管：本进程一退出它就自动删，且它是以管理员身份
+            # 建的、普通权限删不掉。这里再弹 UAC 既多余又扰民，直接跳过。
+            fw_state_drop(e)
+            FW_MANAGED.pop(int(e.get("port") or 0), None)
+            log.info("TCP %s 的临时放行规则已交给守护进程回收", e.get("port"))
+            continue
         ok, _ = _rule_del(e)
         if ok:
             fw_state_drop(e)
@@ -2537,8 +2657,10 @@ def fw_cleanup_all(reason: str = "") -> int:
     if n:
         log.info("防火墙已恢复：删除 %d 条临时放行规则%s", n, f"（{reason}）" if reason else "")
     # 没管理员权限删不掉时，弹一次 UAC 兜底（点“是”即恢复，点“否”留给下次启动回收）
-    if leftover and _elevate_fw("fw --close --all"):
-        log.info("已请求管理员权限恢复 %d 条遗留规则", len(leftover))
+    if leftover:
+        cmds = [_win_netsh_del(str(e.get("name") or "")) for e in leftover if e.get("name")]
+        if _elevate_fw(cmds):
+            log.info("已请求管理员权限恢复 %d 条遗留规则", len(leftover))
     return n
 
 

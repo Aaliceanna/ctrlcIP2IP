@@ -500,9 +500,30 @@ async function fwOpen(){
       : '将临时放行该端口，ClipShare 关闭或闪退后自动恢复。继续？')) return;
   try{
     const r = await api('/api/firewall', {action:'open', mode: persist ? 'persist' : 'temp'});
-    if (r.ok) toast('已放行 TCP ' + r.port);
-    else toast(r.elevating ? '请在 UAC 弹窗中点“是”' : ('放行失败：' + (r.error || '')));
-    setTimeout(fwCheck, 1500);
+    if (r.ok){
+      toast('已放行 TCP ' + r.port);
+      setTimeout(fwCheck, 500);
+      return;
+    }
+    if (!r.elevating){
+      toast('放行失败：' + (r.error || ''));
+      return;
+    }
+    // 提权是异步的，UAC 什么时候被点不可控 —— 轮询直到规则真的出现
+    toast('请在 UAC 弹窗中点“是”，放行后会自动刷新');
+    const btn = document.getElementById('btnFwOpen');
+    if (btn){ btn.disabled = true; btn.textContent = '等待管理员授权…'; }
+    for (let i = 0; i < 60; i++){
+      await new Promise(res => setTimeout(res, 1000));
+      const f = await fwCheck();
+      if (f && f.rule_exists){
+        toast('已放行 TCP ' + f.port);
+        return;
+      }
+      if (btn) btn.textContent = '等待管理员授权… ' + (60 - i - 1) + 's';
+    }
+    toast('未检测到放行结果：UAC 可能被取消，可点“重新检测”确认');
+    fwCheck();
   }catch(e){ toast('操作失败：' + e.message); }
 }
 
