@@ -12,3 +12,4 @@ release/
 .venv/
 *.log
 config.json
+dist-new/
