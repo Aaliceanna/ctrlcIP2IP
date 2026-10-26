@@ -19,19 +19,19 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+      - name: Install deps
+        run: python -m pip install --upgrade pip pyinstaller pystray pillow
 
-      - name: Build
+      - name: Build (tray + cli)
         run: |
-          python -m PyInstaller --onefile --noconfirm --clean --name clipshare clipshare.py
-          python -m PyInstaller --onefile --noconsole --noconfirm --clean --name clipshared clipshare.py
+          python -m PyInstaller --onefile --noconfirm --clean --name clipshare-cli --collect-submodules pystray --collect-submodules PIL clipshare.py
+          python -m PyInstaller --onefile --noconsole --noconfirm --clean --name ClipShare --collect-submodules pystray --collect-submodules PIL clipshare.py
 
       - name: Package
         run: |
           New-Item -ItemType Directory -Force -Path out | Out-Null
-          Copy-Item dist\clipshare.exe out\
-          Copy-Item dist\clipshared.exe out\
+          Copy-Item dist\ClipShare.exe out\
+          Copy-Item dist\clipshare-cli.exe out\
           Copy-Item README.md out\
           Compress-Archive -Path out\* -DestinationPath clipshare-windows-x64.zip -Force
 
@@ -50,12 +50,16 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install PyInstaller
-        run: python -m pip install --upgrade pip pyinstaller
+      - name: Install deps
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq python3-tk
+          python -m pip install --upgrade pip pyinstaller pystray pillow
 
       - name: Build
         run: |
-          python -m PyInstaller --onefile --noconfirm --clean --name clipshare clipshare.py
+          python -m PyInstaller --onefile --noconfirm --clean --name clipshare \
+            --collect-submodules pystray --collect-submodules PIL clipshare.py
           chmod +x dist/clipshare
           mkdir -p out
           cp dist/clipshare out/

@@ -43,13 +43,19 @@ import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "ClipShare"
+
+try:  # 设置面板 HTML（缺失时降级，不影响同步功能）
+    from webui import HTML_UI
+except Exception:  # pragma: no cover
+    HTML_UI = "<h1>设置面板缺失：请把 webui.py 放在同一目录</h1>"
 
 
 # --------------------------------------------------------------------------
@@ -277,6 +283,7 @@ def default_config() -> dict:
         "max_kb": 512,
         "poll_ms": 200,
         "sync_files": False,
+        "log_level": "info",   # info | debug（托盘/面板可切换）
     }
 
 
@@ -353,6 +360,16 @@ def http_json(url: str, payload=None, token: str = "", timeout: float = 5.0):
 # --------------------------------------------------------------------------
 # 核心
 # --------------------------------------------------------------------------
+def apply_log_level(cfg: dict) -> None:
+    lvl = logging.DEBUG if str(cfg.get("log_level", "info")).lower() == "debug" else logging.INFO
+    log.setLevel(lvl)
+    for h in log.handlers:
+        if isinstance(h, logging.StreamHandler) and not isinstance(
+            h, logging.handlers.RotatingFileHandler
+        ):
+            h.setLevel(lvl)
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -372,6 +389,7 @@ class Core:
         self.last_recv_at = 0
         self.suppress_until = 0.0
         self.stop_event = threading.Event()
+        self.paused = False
         self.peer_state: dict = {}
         self.cfg_mtime = config_mtime()
         self.pusher = Pusher(self)
@@ -391,6 +409,8 @@ class Core:
 
     # ---- 收到对端剪贴板 ----
     def apply_remote(self, clip: dict) -> str:
+        if self.paused:
+            return "paused"
         text = clip.get("text")
         if not isinstance(text, str) or text == "":
             return "empty"
@@ -463,7 +483,7 @@ class Pusher(threading.Thread):
 
     def _deliver(self, peer: dict, payload: dict) -> None:
         url = peer_base(peer) + "/api/clip"
-        key = f"{peer.get('name') or ''}@{peer.get('host')}:{peer.get('port')}"
+        key = peer_key(peer)
         last_err = ""
         for attempt in range(3):
             try:
@@ -498,6 +518,10 @@ def poller_loop(core: Core) -> None:
             if seq == 0 or seq == core.last_seq:
                 continue
             core.last_seq = seq
+            if core.paused:
+                # 暂停期间不推送，但记录内容，恢复后不会补发历史
+                core.last_text = clip.read() or core.last_text
+                continue
             if time.time() < core.suppress_until:
                 continue  # 自己刚写入的，不回推
             text = clip.read()
@@ -530,6 +554,7 @@ def poller_loop(core: Core) -> None:
 # --------------------------------------------------------------------------
 CORE: Core | None = None
 SERVER = None
+TRAY = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -582,11 +607,33 @@ class Handler(BaseHTTPRequestHandler):
             "ts": now_ms(),
         }
 
+    def _html(self, text: str, code: int = 200) -> None:
+        body = text.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
     # ---- 路由 ----
     def do_GET(self):
+        path = urllib.parse.urlparse(self.path)
+
+        # 设置面板：令牌通过查询参数带入（本地访问，便于浏览器直接打开）
+        if path.path in ("/", "/ui", "/ui/"):
+            qs = urllib.parse.parse_qs(path.query)
+            t = (qs.get("t") or [""])[0]
+            try:
+                ok = hmac.compare_digest(t, CORE.cfg["token"])
+            except Exception:
+                ok = False
+            if not ok:
+                return self._html("<h1>401</h1><p>令牌无效，请从托盘菜单重新打开设置面板。</p>", 401)
+            return self._html(HTML_UI)
+
         if not self._authed():
             return self._json(401, {"ok": False, "error": "unauthorized"})
-        path = urllib.parse.urlparse(self.path)
         if path.path in ("/api/ping", "/api/info"):
             return self._json(200, self._common())
         if path.path == "/api/clip":
@@ -596,6 +643,34 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": True, "clip": clip if clip and clip["ts"] > since else None})
         if path.path == "/api/status":
             return self._json(200, self._status())
+        if path.path == "/api/mylink":
+            return self._json(
+                200, {"ok": True, "link": build_link(CORE.cfg, local_ip())}
+            )
+        if path.path == "/api/log":
+            qs = urllib.parse.parse_qs(path.query)
+            try:
+                n = int((qs.get("lines") or ["200"])[0])
+            except ValueError:
+                n = 200
+            return self._json(200, {"ok": True, "text": tail_log(n)})
+        if path.path == "/api/config":
+            cfg = CORE.cfg
+            return self._json(
+                200,
+                {
+                    "ok": True,
+                    "config": {
+                        "name": cfg["name"],
+                        "bind": cfg["bind"],
+                        "port": cfg["port"],
+                        "max_kb": cfg["max_kb"],
+                        "poll_ms": cfg["poll_ms"],
+                        "log_level": cfg.get("log_level", "info"),
+                    },
+                    "autostart": autostart_installed(),
+                },
+            )
         if path.path == "/api/reload":
             ok = CORE.reload()
             return self._json(200, {"ok": ok, "peers": len(CORE.cfg.get("peers") or [])})
@@ -609,19 +684,100 @@ class Handler(BaseHTTPRequestHandler):
         if not self._authed():
             return self._json(401, {"ok": False, "error": "unauthorized"})
         path = urllib.parse.urlparse(self.path).path
+
         if path == "/api/clip":
             body = self._body()
             if not isinstance(body, dict):
                 return self._json(400, {"ok": False, "error": "bad_json"})
             res = CORE.apply_remote(body)
-            code = 200 if res in ("ok", "same", "dup") else 400
-            return self._json(code, {"ok": res in ("ok", "same", "dup"), "result": res})
+            code = 200 if res in ("ok", "same", "dup", "paused") else 400
+            return self._json(code, {"ok": res in ("ok", "same", "dup", "paused"), "result": res})
+
         if path == "/api/broadcast":
             body = self._body()
             if not isinstance(body, dict) or not isinstance(body.get("text"), str):
                 return self._json(400, {"ok": False, "error": "bad_json"})
             CORE.broadcast(body["text"], origin="cli")
             return self._json(200, {"ok": True, "peers": len(CORE.cfg.get("peers") or [])})
+
+        if path == "/api/bind":
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            if body.get("link"):
+                try:
+                    peer = parse_link(str(body["link"]))
+                except ValueError as exc:
+                    return self._json(400, {"ok": False, "error": str(exc)})
+            else:
+                host = str(body.get("host") or "").strip()
+                token = str(body.get("token") or "").strip()
+                if not host or not token:
+                    return self._json(400, {"ok": False, "error": "IP 和令牌必填"})
+                try:
+                    port = int(body.get("port") or 8765)
+                except (TypeError, ValueError):
+                    port = 8765
+                peer = {
+                    "host": host,
+                    "port": port,
+                    "token": token,
+                    "name": str(body.get("name") or host),
+                }
+            updated = upsert_peer(CORE.cfg, peer)
+            CORE.reload()
+            ok, detail = handshake(peer)
+            log.info("绑定对端 %s:%s（%s）→ %s", peer["host"], peer["port"],
+                     "更新" if updated else "新增", "成功" if ok else detail)
+            return self._json(
+                200,
+                {
+                    "ok": ok,
+                    "peer": f"{peer['name']} {peer_key(peer)}",
+                    "updated": updated,
+                    "error": "" if ok else detail,
+                },
+            )
+
+        if path == "/api/unbind":
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            n = remove_peer(CORE.cfg, str(body.get("key") or ""))
+            CORE.reload()
+            return self._json(200, {"ok": n > 0, "removed": n})
+
+        if path == "/api/pause":
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            CORE.paused = bool(body.get("paused"))
+            log.info("同步已%s", "暂停" if CORE.paused else "恢复")
+            return self._json(200, {"ok": True, "paused": CORE.paused})
+
+        if path == "/api/config":
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            if "log_level" in body:
+                CORE.cfg["log_level"] = "debug" if str(body["log_level"]).lower() == "debug" else "info"
+                apply_log_level(CORE.cfg)
+                save_config(CORE.cfg)
+                log.info("日志级别切换为 %s", CORE.cfg["log_level"])
+            if "autostart" in body:
+                if body["autostart"]:
+                    install_autostart()
+                else:
+                    uninstall_autostart()
+            return self._json(
+                200,
+                {
+                    "ok": True,
+                    "log_level": CORE.cfg.get("log_level", "info"),
+                    "autostart": autostart_installed(),
+                },
+            )
+
         if path == "/api/reload":
             ok = CORE.reload()
             return self._json(200, {"ok": ok, "peers": len(CORE.cfg.get("peers") or [])})
@@ -640,14 +796,16 @@ class Handler(BaseHTTPRequestHandler):
             "bind": f"{cfg['bind']}:{cfg['port']}",
             "listen": SERVER.server_address[:2] if SERVER else None,
             "uptime_s": int(time.time() - CORE.started_at),
+            "paused": bool(CORE.paused),
+            "log_level": cfg.get("log_level", "info"),
+            "autostart": autostart_installed(),
             "peers": [
                 {
+                    "key": peer_key(p),
                     "name": p.get("name"),
                     "host": p.get("host"),
                     "port": p.get("port"),
-                    "state": CORE.peer_state.get(
-                        f"{p.get('name') or ''}@{p.get('host')}:{p.get('port')}", {}
-                    ),
+                    "state": CORE.peer_state.get(peer_key(p), {}),
                 }
                 for p in cfg.get("peers") or []
             ],
@@ -667,6 +825,11 @@ def _shutdown() -> None:
     if SERVER:
         try:
             SERVER.shutdown()
+        except Exception:
+            pass
+    if TRAY is not None:
+        try:
+            TRAY.stop()
         except Exception:
             pass
 
@@ -757,6 +920,65 @@ def parse_link(link: str) -> dict:
     }
 
 
+def peer_key(p: dict) -> str:
+    return f"{p.get('host')}:{int(p.get('port') or 8765)}"
+
+
+def upsert_peer(cfg: dict, peer: dict) -> bool:
+    """写入对端配置，返回是否为更新已有项。"""
+    peers = cfg.setdefault("peers", [])
+    for p in peers:
+        if str(p.get("host")) == str(peer["host"]) and int(p.get("port")) == int(peer["port"]):
+            p.update(peer)
+            save_config(cfg)
+            return True
+    peers.append(peer)
+    save_config(cfg)
+    return False
+
+
+def remove_peer(cfg: dict, key: str) -> int:
+    key = (key or "").strip()
+    peers = cfg.get("peers") or []
+    keep = [
+        p
+        for p in peers
+        if key
+        not in (
+            str(p.get("name")),
+            str(p.get("host")),
+            peer_key(p),
+            f"{p.get('name')}@{peer_key(p)}",
+        )
+    ]
+    cfg["peers"] = keep
+    save_config(cfg)
+    return len(peers) - len(keep)
+
+
+def handshake(peer: dict, timeout: float = 4.0) -> tuple[bool, str]:
+    try:
+        _, obj = http_json(peer_base(peer) + "/api/ping", token=peer.get("token", ""), timeout=timeout)
+        return True, f"{obj.get('name')} v{obj.get('version')}"
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            return False, "令牌不匹配（请重新复制对方配对链接）"
+        return False, f"HTTP {exc.code}"
+    except Exception as exc:
+        return False, f"{type(exc).__name__}：检查 IP/端口/防火墙/对方是否开机"
+
+
+def tail_log(lines: int = 200) -> str:
+    try:
+        with open(LOG_PATH, "r", encoding="utf-8", errors="replace") as f:
+            data = f.readlines()
+        return "".join(data[-max(1, min(lines, 2000)):])
+    except FileNotFoundError:
+        return ""
+    except Exception as exc:
+        return f"读取日志失败：{exc}"
+
+
 # --------------------------------------------------------------------------
 # 开机自启
 # --------------------------------------------------------------------------
@@ -776,12 +998,24 @@ def gui_python() -> str:
 
 
 def daemon_exe() -> str | None:
-    """打包版会额外产出一个无控制台窗口的同目录程序 clipshared(.exe)。"""
+    """打包版会额外产出一个无控制台窗口的同目录程序（托盘入口）。
+
+    注意：Windows 文件名不区分大小写，所以 CLI 版必须叫 clipshare-cli.exe，
+    不能叫 clipshare.exe，否则会和 ClipShare.exe 互相覆盖。
+    """
     if not is_frozen():
         return None
-    name = "clipshared.exe" if os.name == "nt" else "clipshared"
-    cand = os.path.join(os.path.dirname(sys.executable), name)
-    return cand if os.path.exists(cand) else None
+    here = os.path.dirname(sys.executable)
+    names = (
+        ["ClipShare.exe", "clipshared.exe", "ClipShare", "clipshared"]
+        if os.name == "nt"
+        else ["ClipShare", "clipshared"]
+    )
+    for n in names:
+        cand = os.path.join(here, n)
+        if os.path.exists(cand):
+            return cand
+    return None
 
 
 def base_argv() -> list[str]:
@@ -793,8 +1027,8 @@ def base_argv() -> list[str]:
 def autostart_command() -> str:
     exe = daemon_exe() or sys.executable
     if is_frozen():
-        return f'"{exe}" run --silent'
-    return f'"{gui_python()}" "{os.path.abspath(__file__)}" run --silent'
+        return f'"{exe}" gui --silent'
+    return f'"{gui_python()}" "{os.path.abspath(__file__)}" gui --silent'
 
 
 # ---- Linux: systemd user unit 或 XDG autostart ----
@@ -951,7 +1185,7 @@ def spawn_background() -> None:
         kwargs["stdout"] = subprocess.DEVNULL
         kwargs["stderr"] = subprocess.DEVNULL
         kwargs["start_new_session"] = True
-    subprocess.Popen(base_argv() + ["run", "--silent"], **kwargs)
+    subprocess.Popen(base_argv() + ["gui", "--silent"], **kwargs)
 
 
 def cmd_start(cfg: dict) -> int:
@@ -981,7 +1215,7 @@ def cmd_run(args, cfg: dict) -> int:
     from http.server import ThreadingHTTPServer as _THS
 
     _THS.daemon_threads = True
-    _THS.allow_reuse_address = True
+    _THS.allow_reuse_address = os.name != "nt"  # Windows 上会允许端口重复绑定，必须关闭
     try:
         SERVER = _THS((cfg["bind"], cfg["port"]), Handler)
     except OSError as exc:
@@ -1005,6 +1239,173 @@ def cmd_run(args, cfg: dict) -> int:
         except Exception:
             pass
         log.info("已停止")
+    return 0
+
+
+def ui_url(cfg: dict) -> str:
+    host = local_service_addr(cfg)
+    return f"http://{host_for_url(host)}:{cfg['port']}/ui?t={cfg['token']}"
+
+
+def open_settings(cfg: dict) -> str:
+    url = ui_url(cfg)
+    if os.environ.get("CLIPSHARE_NO_OPEN"):
+        log.info("跳过打开浏览器（CLIPSHARE_NO_OPEN）：%s", url)
+        return url
+    try:
+        if os.name == "nt":
+            os.startfile(url)  # type: ignore[attr-defined]
+        else:
+            webbrowser.open(url)
+    except Exception:
+        try:
+            webbrowser.open(url)
+        except Exception:
+            pass
+    return url
+
+
+def fatal(msg: str) -> None:
+    log.error(msg)
+    if os.name == "nt":
+        try:
+            ctypes.windll.user32.MessageBoxW(0, msg, "ClipShare", 0x10)
+            return
+        except Exception:
+            pass
+    print(msg, file=sys.stderr)
+
+
+def _start_service(cfg: dict):
+    """初始化核心与 HTTP 服务（托盘 / 无界面共用）。"""
+    global CORE, SERVER
+    clipboard()
+    CORE = Core(cfg)
+    CORE.pusher.start()
+    threading.Thread(target=poller_loop, args=(CORE,), daemon=True, name="poller").start()
+    ThreadingHTTPServer.daemon_threads = True
+    # Windows 上 SO_REUSEADDR 允许两个进程绑定同一端口（请求被随机劫持），必须关闭
+    ThreadingHTTPServer.allow_reuse_address = os.name != "nt"
+    SERVER = ThreadingHTTPServer((cfg["bind"], cfg["port"]), Handler)
+    threading.Thread(
+        target=SERVER.serve_forever, kwargs={"poll_interval": 0.4}, daemon=True, name="http"
+    ).start()
+    return CORE, SERVER
+
+
+# ---- 托盘动作 ----
+def _toggle_pause() -> None:
+    CORE.paused = not CORE.paused
+    log.info("同步已%s", "暂停" if CORE.paused else "恢复")
+
+
+def _toggle_debug() -> None:
+    new = "info" if str(CORE.cfg.get("log_level", "info")) == "debug" else "debug"
+    CORE.cfg["log_level"] = new
+    apply_log_level(CORE.cfg)
+    save_config(CORE.cfg)
+    log.info("日志级别切换为 %s", new)
+
+
+def _toggle_autostart() -> None:
+    if autostart_installed():
+        uninstall_autostart()
+        log.info("已取消开机自启")
+    else:
+        install_autostart()
+        log.info("已设置开机自启")
+
+
+def _copy_my_link() -> str:
+    link = build_link(CORE.cfg, local_ip())
+    try:
+        clipboard().write(link)
+    except Exception:
+        pass
+    return link
+
+
+def _open_log_file() -> None:
+    try:
+        if os.name == "nt":
+            os.startfile(LOG_PATH)  # type: ignore[attr-defined]
+        else:
+            webbrowser.open("file://" + LOG_PATH)
+    except Exception as exc:
+        log.warning("打开日志失败: %s", exc)
+
+
+def cmd_gui(args, cfg: dict) -> int:
+    global TRAY
+    if service_alive(cfg):
+        url = open_settings(cfg)
+        log.info("已有实例在运行，打开设置面板 %s", url)
+        if not getattr(args, "silent", False):
+            print(f"服务已在运行，已打开设置面板：{url}")
+        return 0
+
+    try:
+        core, server = _start_service(cfg)
+    except OSError as exc:
+        fatal(f"端口 {cfg['port']} 无法监听：{exc}\n可能已有另一个 ClipShare 实例在运行。")
+        return 2
+
+    log.info(
+        "ClipShare %s 已启动（托盘）监听=%s:%s 对端=%d",
+        VERSION,
+        cfg["bind"],
+        cfg["port"],
+        len(cfg.get("peers") or []),
+    )
+
+    try:
+        import gui  # 同目录模块
+    except Exception as exc:
+        gui = None
+        log.warning("托盘模块加载失败: %s", exc)
+
+    if gui is None or not gui.available():
+        log.warning("托盘组件缺失（pip install pystray pillow），改为前台常驻")
+        if not getattr(args, "silent", False):
+            print("托盘组件缺失，已改为前台运行，Ctrl+C 退出。设置面板：" + ui_url(cfg))
+        try:
+            while not core.stop_event.wait(1.0):
+                pass
+        except KeyboardInterrupt:
+            pass
+        finally:
+            _shutdown()
+        return 0
+
+    hooks = {
+        "title": lambda: f"ClipShare · {CORE.cfg['name']}",
+        "status": lambda: (
+            f"已绑定 {len(CORE.cfg.get('peers') or [])} 个对端"
+            + ("（同步已暂停）" if CORE.paused else "")
+        ),
+        "open_ui": lambda: open_settings(CORE.cfg),
+        "paused": lambda: CORE.paused,
+        "toggle_pause": _toggle_pause,
+        "debug": lambda: str(CORE.cfg.get("log_level", "info")) == "debug",
+        "toggle_debug": _toggle_debug,
+        "autostart": autostart_installed,
+        "toggle_autostart": _toggle_autostart,
+        "copy_link": _copy_my_link,
+        "open_log": _open_log_file,
+        "shutdown": _shutdown,
+    }
+    app = gui.TrayApp(hooks)
+    TRAY = app.icon
+    if not cfg.get("peers") and not getattr(args, "silent", False):
+        open_settings(cfg)  # 首次手动运行自动打开设置面板，引导绑定；开机自启时不弹浏览器
+    try:
+        app.run()
+    finally:
+        log.info("托盘退出")
+        try:
+            server.server_close()
+        except Exception:
+            pass
     return 0
 
 
@@ -1249,9 +1650,10 @@ def cmd_log(args, cfg: dict) -> int:
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="clipshare",
-        description="ClipShare —— 通过指定 IP 的端到端剪贴板共享（Windows）",
+        description="ClipShare —— 通过指定 IP 的端到端剪贴板共享（Windows / Linux）。"
+        "不带参数运行 = 启动托盘界面。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="例：python clipshare.py install   然后  python clipshare.py link",
+        epilog="例：双击 ClipShare.exe 启动托盘；命令行用 clipshare-cli.exe status 查看状态",
     )
     p.add_argument("-v", "--version", action="version", version=f"ClipShare {VERSION}")
     sub = p.add_subparsers(dest="cmd")
@@ -1306,6 +1708,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--new-token", dest="new_token", action="store_true")
     s.set_defaults(fn=cmd_config)
 
+    s = sub.add_parser("gui", help="启动托盘界面（不带参数运行时默认执行）")
+    s.add_argument("--silent", action="store_true")
+    s.set_defaults(fn=cmd_gui)
+
     s = sub.add_parser("log", help="查看最近日志")
     s.add_argument("-n", "--lines", type=int, default=40)
     s.set_defaults(fn=cmd_log)
@@ -1334,12 +1740,15 @@ def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
     if not args.cmd:
-        parser.print_help()
-        return 0
+        # 双击 exe / 不带参数运行 → 直接进托盘，不再打印帮助后秒退
+        args.cmd = "gui"
+        args.silent = False
+        args.fn = cmd_gui
     silent = bool(getattr(args, "silent", False))
     os.makedirs(HOME, exist_ok=True)
     setup_logging(silent)
     cfg = load_config()
+    apply_log_level(cfg)
     try:
         return int(args.fn(args, cfg) or 0)
     except KeyboardInterrupt:

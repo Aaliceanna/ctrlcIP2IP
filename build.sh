@@ -11,11 +11,12 @@ if [ ! -x .venv/bin/python ]; then
   "$PY" -m venv .venv
 fi
 
-echo "[2/3] 安装 PyInstaller..."
-.venv/bin/python -m pip install -q --upgrade pip pyinstaller
+echo "[2/3] 安装依赖..."
+.venv/bin/python -m pip install -q --upgrade pip pyinstaller pystray pillow
 
 echo "[3/3] 编译..."
-.venv/bin/python -m PyInstaller --onefile --noconfirm --clean --name clipshare clipshare.py
+.venv/bin/python -m PyInstaller --onefile --noconfirm --clean --name clipshare \
+  --collect-submodules pystray --collect-submodules PIL clipshare.py
 chmod +x dist/clipshare
 
 echo

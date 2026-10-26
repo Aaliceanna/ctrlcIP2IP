@@ -12,18 +12,20 @@ if not exist ".venv\Scripts\python.exe" (
   exit /b 1
 )
 
-echo [2/3] 安装 PyInstaller...
-".venv\Scripts\python.exe" -m pip install -q --upgrade pip pyinstaller
+echo [2/3] 安装依赖...
+".venv\Scripts\python.exe" -m pip install -q --upgrade pip pyinstaller pystray pillow
 
 echo [3/3] 编译...
-".venv\Scripts\python.exe" -m PyInstaller --onefile --noconfirm --clean --name clipshare clipshare.py
-".venv\Scripts\python.exe" -m PyInstaller --onefile --noconsole --noconfirm --clean --name clipshared clipshare.py
+".venv\Scripts\python.exe" -m PyInstaller --onefile --noconfirm --clean --name clipshare-cli ^
+  --collect-submodules pystray --collect-submodules PIL clipshare.py
+".venv\Scripts\python.exe" -m PyInstaller --onefile --noconsole --noconfirm --clean --name ClipShare ^
+  --collect-submodules pystray --collect-submodules PIL clipshare.py
 
 echo.
 echo 产物:
 dir /b dist
 echo.
-echo   clipshare.exe   带控制台，用于命令行操作
-echo   clipshared.exe  无控制台，用于开机自启常驻
+echo   ClipShare.exe      双击运行，托盘常驻（推荐）
+echo   clipshare-cli.exe  带控制台，命令行操作用
 echo.
 pause
