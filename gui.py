@@ -59,6 +59,8 @@ class TrayApp:
                      checked=lambda i: self.h["fw_open"]()),
             MenuItem("打开日志文件", self._open_log),
             MenuItem("开机自启", self._toggle_autostart, checked=lambda i: self.h["autostart"]()),
+            MenuItem(lambda i: self.h.get("update_label", lambda: "检查更新…")(),
+                     self._do_update),
             Menu.SEPARATOR,
             MenuItem("退出 ClipShare", self._quit),
         )
@@ -97,6 +99,13 @@ class TrayApp:
     def _copy_link(self, icon=None, item=None) -> None:
         link = self.h["copy_link"]()
         self._notify(f"已复制配对链接\n{link}")
+
+    def _do_update(self, icon=None, item=None) -> None:
+        try:
+            msg = self.h.get("do_update", lambda: "")()
+        except Exception as exc:
+            msg = f"检查更新失败：{exc}"
+        self._notify(msg or "检查完成")
 
     def _open_log(self, icon=None, item=None) -> None:
         self.h["open_log"]()

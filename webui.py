@@ -59,6 +59,13 @@ HTML_UI = r"""<!DOCTYPE html>
     border:1px solid #cbe8d4;padding:1px 6px;border-radius:20px;margin-left:4px;white-space:nowrap}
   .mutual.off{color:#b45309;background:#fef3c7;border-color:#fde68a}
   .switch{display:flex;align-items:center;gap:8px;margin:8px 0;cursor:pointer}
+  .switch.inline{margin:0;white-space:nowrap}
+  .batch{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px}
+  button.danger{color:var(--bad);border-color:#f6cece}
+  button.danger:hover{background:#fdeaea}
+  .flag{font-size:11px;padding:1px 6px;border-radius:20px;margin-right:4px;white-space:nowrap}
+  .flag.on{color:var(--ok);background:#e8f5ec;border:1px solid #cbe8d4}
+  .flag.off{color:#b45309;background:#fef3c7;border:1px solid #fde68a}
   .switch input{width:16px;height:16px;accent-color:var(--accent)}
   pre#log{background:#0f172a;color:#d6e2f0;padding:12px;border-radius:8px;height:240px;
     overflow:auto;font:12px/1.6 Consolas,Menlo,monospace;white-space:pre-wrap;margin:0}
@@ -162,11 +169,37 @@ HTML_UI = r"""<!DOCTYPE html>
   </section>
 
   <section class="card">
-    <h2>已绑定对端</h2>
+    <h2>已绑定对端 <span class="tag" id="peerTag">0 个</span></h2>
+    <div class="batch">
+      <label class="switch inline"><input type="checkbox" id="selAll" onchange="toggleAll(this)"> 全选</label>
+      <button class="mini" onclick="batch('deny_push')">禁止推送</button>
+      <button class="mini" onclick="batch('deny_recv')">禁止接收</button>
+      <button class="mini" onclick="batch('deny_all')">全禁止</button>
+      <button class="mini" onclick="batch('allow_all')">恢复收发</button>
+      <button class="mini danger" onclick="batch('unbind')">解绑</button>
+      <span class="hint" id="selCount" style="margin:0">未选择</span>
+    </div>
     <table>
-      <thead><tr><th>名称</th><th>地址</th><th>状态</th><th></th></tr></thead>
-      <tbody id="peerRows"><tr><td colspan="4" style="color:#6b7280">尚未绑定</td></tr></tbody>
+      <thead><tr><th style="width:28px"></th><th>名称</th><th>地址</th><th>收发</th><th>状态</th><th></th></tr></thead>
+      <tbody id="peerRows"><tr><td colspan="6" style="color:#6b7280">尚未绑定</td></tr></tbody>
     </table>
+    <p class="hint">勾选多个对端后可一次性设置：禁止推送＝本机复制的内容不发给它；禁止接收＝它推过来的内容不写进本机剪贴板。</p>
+  </section>
+
+  <section class="card">
+    <h2>更新 <span class="tag" id="updTag">v-</span></h2>
+    <div class="grid">
+      <div><label>当前版本</label><div id="updCur">-</div></div>
+      <div><label>仓库最新版本</label><div id="updLatest">-</div></div>
+      <div><label>上次检查</label><div id="updWhen">-</div></div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="primary" id="btnUpdApply" onclick="updateApply()">升级到最新版</button>
+      <button onclick="updateCheck()">立即检查</button>
+      <button onclick="window.open('https://github.com/Aaliceanna/ctrlcIP2IP/releases/latest','_blank')">打开发布页</button>
+    </div>
+    <label class="switch"><input type="checkbox" id="swAutoUpdate" onchange="setAutoUpdate(this)"> 自动检查并安装更新（每 6 小时一次，与 GitHub Release 同步）</label>
+    <div id="updMsg" class="hint"></div>
   </section>
 
   <section class="card">
@@ -228,29 +261,25 @@ async function refresh(){
     document.getElementById('swSync').checked = !s.paused;
     document.getElementById('swDebug').checked = (s.log_level === 'debug');
     document.getElementById('swAuto').checked = !!s.autostart;
-
-    const rows = document.getElementById('peerRows');
-    if (!s.peers.length){
-      rows.innerHTML = '<tr><td colspan="4" style="color:#6b7280">尚未绑定</td></tr>';
-    } else {
-      rows.innerHTML = s.peers.map(p=>{
-        const ok = p.state && p.state.ok;
-        const cls = p.state ? (ok?'ok':'bad') : 'unk';
-        const txt = p.state ? (ok?'正常':(p.state.err||'失败')) : '未探测';
-        const mutual = p.mutual
-          ? '<span class="mutual" title="对方也绑定了本机">双向</span>'
-          : '<span class="mutual off" title="只有本机单向绑定，建议重新绑定一次">单向</span>';
-        return `<tr>
-          <td>${p.name||''} ${mutual}</td>
-          <td>${p.host}:${p.port}</td>
-          <td><span class="dot ${cls}"></span>${txt}</td>
-          <td><button class="mini" onclick="unbind('${p.key}')">删除</button></td>
-        </tr>`;
-      }).join('');
-    }
+    renderPeers(s.peers || []);
 
     const link = await api('/api/mylink');
     document.getElementById('mylink').value = link.link;
+
+    const up = s.update || {};
+    document.getElementById('updCur').textContent = 'v' + (up.current || '');
+    document.getElementById('updLatest').textContent = up.latest ? ('v' + up.latest) : '未检查';
+    document.getElementById('updWhen').textContent = up.last_check
+      ? new Date(up.last_check*1000).toLocaleString('zh-CN',{hour12:false}) : '从未';
+    const utag = document.getElementById('updTag');
+    const newer = up.latest && versionCmp(up.latest, up.current) > 0;
+    utag.textContent = newer ? ('有新版本 v' + up.latest) : '已是最新';
+    utag.style.background = newer ? '#fdeaea' : '#e8f5ec';
+    utag.style.color = newer ? 'var(--bad)' : 'var(--ok)';
+    document.getElementById('btnUpdApply').disabled = !newer;
+    document.getElementById('btnUpdApply').textContent = newer
+      ? ('升级到 v' + up.latest) : '升级到最新版';
+    document.getElementById('swAutoUpdate').checked = up.auto_update !== false;
 
     const cfg = await api('/api/config');
     const c = cfg.config || {};
@@ -358,6 +387,79 @@ async function bindManual(){
   }catch(e){ toast('绑定失败：' + e.message); }
 }
 
+function versionCmp(a, b){
+  const pa = String(a||'').replace(/^v/,'').split('.').map(Number);
+  const pb = String(b||'').replace(/^v/,'').split('.').map(Number);
+  for (let i=0;i<4;i++){
+    const x = pa[i]||0, y = pb[i]||0;
+    if (x !== y) return x > y ? 1 : -1;
+  }
+  return 0;
+}
+
+/* ---------- 对端批量操作 ---------- */
+function renderPeers(peers){
+  const rows = document.getElementById('peerRows');
+  document.getElementById('peerTag').textContent = peers.length + ' 个';
+  if (!peers.length){
+    rows.innerHTML = '<tr><td colspan="6" style="color:#6b7280">尚未绑定</td></tr>';
+    updateSelCount();
+    return;
+  }
+  rows.innerHTML = peers.map(p=>{
+    const ok = p.state && p.state.ok;
+    const cls = p.state ? (ok?'ok':'bad') : 'unk';
+    const txt = p.state ? (ok?'正常':(p.state.err||'失败')) : '未探测';
+    const mutual = p.mutual
+      ? '<span class="mutual" title="对方也绑定了本机">双向</span>'
+      : '<span class="mutual off" title="只有本机单向绑定，建议重新绑定一次">单向</span>';
+    const push = p.push === false
+      ? '<span class="flag off">禁推送</span>' : '<span class="flag on">可推送</span>';
+    const recv = p.recv === false
+      ? '<span class="flag off">禁接收</span>' : '<span class="flag on">可接收</span>';
+    return `<tr>
+      <td><input type="checkbox" class="sel" value="${p.key}" onchange="updateSelCount()"></td>
+      <td>${p.name||''} ${mutual}</td>
+      <td>${p.host}:${p.port}</td>
+      <td>${push}${recv}</td>
+      <td><span class="dot ${cls}"></span>${txt}</td>
+      <td><button class="mini" onclick="unbind('${p.key}')">删除</button></td>
+    </tr>`;
+  }).join('');
+  updateSelCount();
+}
+
+function selectedKeys(){
+  return [...document.querySelectorAll('.sel:checked')].map(e=>e.value);
+}
+
+function updateSelCount(){
+  const n = selectedKeys().length;
+  document.getElementById('selCount').textContent = n ? ('已选 ' + n + ' 个') : '未选择';
+}
+
+function toggleAll(el){
+  document.querySelectorAll('.sel').forEach(e=>{ e.checked = el.checked; });
+  updateSelCount();
+}
+
+async function batch(action){
+  const keys = selectedKeys();
+  if (!keys.length) return toast('请先勾选要操作的对端');
+  const names = {deny_push:'禁止推送', deny_recv:'禁止接收',
+                 deny_all:'全部禁止（不推不收）', allow_all:'恢复双向收发', unbind:'解绑'};
+  if (!confirm('对选中的 ' + keys.length + ' 个对端执行「' + (names[action]||action) + '」？'
+      + (action==='unbind' ? '\n同时会通知对方把本机也删掉。' : ''))) return;
+  try{
+    const r = await api('/api/peers/batch', {action, keys});
+    if (!r.ok) return toast('操作失败：' + (r.error||''));
+    toast(action==='unbind'
+      ? ('已解绑 ' + (r.removed||0) + ' 个' + (r.remote_removed ? ('，对方移除 ' + r.remote_removed + ' 个') : ''))
+      : ('已更新 ' + (r.updated||[]).length + ' 个对端'));
+    refresh();
+  }catch(e){ toast('操作失败：' + e.message); }
+}
+
 async function unbind(key){
   if (!confirm('解除绑定？同时会通知对方把本机也删掉。')) return;
   try{
@@ -422,6 +524,55 @@ async function setDebug(el){
   catch(e){ toast('操作失败'); }
 }
 
+/* ---------- 更新 ---------- */
+async function updateCheck(force){
+  try{
+    const r = await api('/api/update', {action:'check', force: !!force});
+    showUpdate(r);
+    return r;
+  }catch(e){
+    document.getElementById('updMsg').textContent = '检查失败：' + e.message;
+  }
+}
+
+async function updateApply(){
+  if (!confirm('将下载 GitHub Release 上的最新版并替换本机程序，完成后自动重启。继续？')) return;
+  try{
+    const r = await api('/api/update', {action:'apply'});
+    showUpdate(r);
+    if (r.updated) toast('已更新，正在重启…');
+    else toast(r.message || r.error || '升级未完成');
+  }catch(e){ toast('升级失败：' + e.message); }
+}
+
+function showUpdate(r){
+  const box = document.getElementById('updMsg');
+  if (!r) return;
+  document.getElementById('updCur').textContent = 'v' + (r.current||'');
+  document.getElementById('updLatest').textContent = r.latest ? ('v' + r.latest) : '-';
+  document.getElementById('updWhen').textContent = r.last_check
+    ? new Date(r.last_check*1000).toLocaleString('zh-CN',{hour12:false}) : '-';
+  const newer = r.latest && versionCmp(r.latest, r.current) > 0;
+  const tag = document.getElementById('updTag');
+  tag.textContent = newer ? ('有新版本 v' + r.latest) : '已是最新';
+  tag.style.background = newer ? '#fdeaea' : '#e8f5ec';
+  tag.style.color = newer ? 'var(--bad)' : 'var(--ok)';
+  document.getElementById('btnUpdApply').disabled = !newer;
+  document.getElementById('btnUpdApply').textContent = newer
+    ? ('升级到 v' + r.latest) : '升级到最新版';
+  document.getElementById('swAutoUpdate').checked = r.auto_update !== false;
+  let msg = r.message || r.error || (newer ? '发现新版本' : '已是最新版');
+  if (r.error) msg = '出错：' + r.error;
+  box.innerHTML = msg + (r.url ? ('　<a href="' + r.url + '" target="_blank">发布页</a>') : '');
+}
+
+async function setAutoUpdate(el){
+  try{
+    await api('/api/update', {auto_update: el.checked});
+    toast(el.checked ? '已开启自动更新' : '已关闭自动更新');
+  }catch(e){ toast('操作失败'); }
+}
+
 async function setAutostart(el){
   try{
     const r = await api('/api/config', {autostart: el.checked});
@@ -442,12 +593,14 @@ refresh();
 loadLog();
 loadNet();
 fwCheck();
+updateCheck();
 document.getElementById('swFwCheck').onchange = (e)=>api('/api/config',{fw_autocheck:e.target.checked});
 document.getElementById('swFwAuto').onchange = (e)=>api('/api/config',{fw_autoopen:e.target.checked});
 setInterval(refresh, 3000);
 setInterval(loadLog, 3000);
 setInterval(loadNet, 6000);
 setInterval(fwCheck, 6000);
+setInterval(updateCheck, 300000);
 </script>
 </body>
 </html>

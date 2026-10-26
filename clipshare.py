@@ -27,6 +27,7 @@ import atexit
 import collections
 import ctypes
 import hmac
+import hashlib
 import json
 import locale
 import logging
@@ -41,6 +42,8 @@ import signal
 import socket
 import subprocess
 import sys
+import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -48,13 +51,17 @@ import urllib.parse
 import urllib.request
 import uuid
 import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.3.0"
+VERSION = "1.4.0"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
 RUN_VALUE = "ClipShare"
+GITHUB_REPO = "Aaliceanna/ctrlcIP2IP"
+UPDATE_API = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+UPDATE_ZIPBALL = "https://codeload.github.com/{repo}/zip/refs/tags/{tag}"
 
 try:  # 设置面板 HTML（缺失时降级，不影响同步功能）
     from webui import HTML_UI
@@ -82,6 +89,8 @@ def app_home() -> str:
 HOME = app_home()
 CONFIG_PATH = os.path.join(HOME, "config.json")
 LOG_PATH = os.path.join(HOME, "clipshare.log")
+LOCK_PATH = os.path.join(HOME, "instance.lock")     # 单实例锁（含占用者 PID）
+UPDATE_DIR = os.path.join(HOME, "update")           # 自动更新的下载/暂存目录
 
 log = logging.getLogger("clipshare")
 
@@ -293,6 +302,10 @@ def default_config() -> dict:
         "fw_autocheck": True,  # 绑定/启动时自动检测防火墙与连通性
         "fw_autoopen": False,  # 检测到被拦截时自动放行（False=只在用户点确认后放行）
         "fw_mode": "temp",     # temp=退出/闪退自动恢复；persist=常驻规则
+        "auto_update": True,   # 自动检查并同步 GitHub Release
+        "update_interval_h": 6,
+        "update_last_check": 0,
+        "update_last_version": "",
     }
 
 
@@ -327,6 +340,18 @@ def load_config() -> dict:
     cfg["fw_autocheck"] = bool(cfg.get("fw_autocheck", True))
     cfg["fw_autoopen"] = bool(cfg.get("fw_autoopen", False))
     cfg["fw_mode"] = "persist" if str(cfg.get("fw_mode", "temp")).lower() == "persist" else "temp"
+    cfg["auto_update"] = bool(cfg.get("auto_update", True))
+    try:
+        cfg["update_interval_h"] = max(0.5, float(cfg.get("update_interval_h") or 6))
+    except (TypeError, ValueError):
+        cfg["update_interval_h"] = 6.0
+    cfg["update_last_check"] = int(cfg.get("update_last_check") or 0)
+    cfg["update_last_version"] = str(cfg.get("update_last_version") or "")
+    for p in cfg.get("peers") or []:
+        # 收发开关缺省为允许；旧配置没有这两个字段也能正常工作
+        for field in ("push", "recv"):
+            if field in p:
+                p[field] = bool(peer_flag(p, field))
     if not (1 <= cfg["port"] <= 65535):
         cfg["port"] = 8765
         changed = True
@@ -347,6 +372,106 @@ def config_mtime() -> float:
         return os.path.getmtime(CONFIG_PATH)
     except OSError:
         return 0.0
+
+
+# --------------------------------------------------------------------------
+# 单实例：同一个配置目录里只允许一个 ClipShare 在跑
+# --------------------------------------------------------------------------
+# 双重保险：① 锁文件记 PID（跨平台，进程死了能被接管）；② Windows 命名互斥量
+# （即使锁文件被误删，重复双击也进不来，且进程被强杀时内核自动释放）。
+_WIN_MUTEX_HANDLE = None
+
+
+def _instance_mutex_name() -> str:
+    digest = hashlib.md5(os.path.abspath(HOME).lower().encode("utf-8")).hexdigest()[:12]
+    return f"Local\\ClipShare-{digest}"
+
+
+def instance_lock_read() -> dict:
+    try:
+        with open(LOCK_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def instance_lock_write(cfg: dict) -> dict:
+    data = {
+        "pid": os.getpid(),
+        "port": int(cfg.get("port") or 0),
+        "token": cfg.get("token", ""),
+        "name": cfg.get("name", ""),
+        "started": int(time.time()),
+        "exe": sys.executable,
+        "version": VERSION,
+    }
+    try:
+        tmp = LOCK_PATH + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, LOCK_PATH)
+    except Exception as exc:
+        log.debug("写入实例锁失败: %s", exc)
+    return data
+
+
+def instance_lock_acquire(cfg: dict) -> tuple[bool, dict]:
+    """抢占单实例锁。返回 (是否抢到, 占用者信息)。"""
+    global _WIN_MUTEX_HANDLE
+    old = instance_lock_read()
+    pid = int(old.get("pid") or 0)
+    if pid and pid != os.getpid() and _pid_alive(pid):
+        return False, old
+    if IS_WIN:
+        try:
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateMutexW.restype = ctypes.c_void_p
+            k32.CreateMutexW.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_wchar_p]
+            handle = k32.CreateMutexW(None, 0, _instance_mutex_name())
+            if handle and ctypes.get_last_error() == 183:  # ERROR_ALREADY_EXISTS
+                k32.CloseHandle(ctypes.c_void_p(handle))
+                log.debug("互斥量已存在，判定为重复启动")
+                return False, old or {"pid": 0, "port": int(cfg.get("port") or 0)}
+            _WIN_MUTEX_HANDLE = handle or None
+        except Exception as exc:
+            log.debug("创建互斥量失败，退化为锁文件: %s", exc)
+    data = instance_lock_write(cfg)
+    atexit.register(instance_lock_release)
+    return True, data
+
+
+def instance_lock_release() -> None:
+    global _WIN_MUTEX_HANDLE
+    try:
+        cur = instance_lock_read()
+        if int(cur.get("pid") or 0) == os.getpid():
+            os.remove(LOCK_PATH)
+    except Exception:
+        pass
+    if _WIN_MUTEX_HANDLE:
+        try:
+            ctypes.windll.kernel32.CloseHandle(ctypes.c_void_p(_WIN_MUTEX_HANDLE))
+        except Exception:
+            pass
+        _WIN_MUTEX_HANDLE = None
+
+
+def other_instance_running(cfg: dict, info: dict, silent: bool) -> int:
+    """已经有实例在跑：本次启动直接结束（顺带把它的设置面板顶到前台）。"""
+    pid = info.get("pid") or "?"
+    live = load_config()
+    if service_alive(live):
+        log.info("检测到已有实例（pid=%s），本次不再重复启动", pid)
+        if silent:
+            return 0
+        url = open_settings(live)
+        print(f"ClipShare 已在运行（pid {pid}），已打开它的设置面板：{url}")
+    else:
+        log.info("检测到另一个实例正在启动（pid=%s），本次退出", pid)
+        if not silent:
+            print(f"ClipShare 已在运行（pid {pid}，服务启动中），本次不再重复启动。")
+    return 0
 
 
 # --------------------------------------------------------------------------
@@ -428,9 +553,25 @@ class Core:
         return True
 
     # ---- 收到对端剪贴板 ----
-    def apply_remote(self, clip: dict) -> str:
+    def peer_by_src(self, src: str) -> dict | None:
+        """按来源 IP 找到对应的已绑定对端（用于「禁止接收」判定）。"""
+        if not src:
+            return None
+        s = str(src).strip()
+        if s.startswith("::ffff:"):
+            s = s[7:]
+        for p in self.cfg.get("peers") or []:
+            if str(p.get("host") or "").strip("[]") == s:
+                return p
+        return None
+
+    def apply_remote(self, clip: dict, src: str = "") -> str:
         if self.paused:
             return "paused"
+        peer = self.peer_by_src(src)
+        if peer is not None and not peer_flag(peer, "recv"):
+            log.info("已拒绝来自 %s 的剪贴板（该对端被设为禁止接收）", peer_key(peer))
+            return "blocked"
         text = clip.get("text")
         if not isinstance(text, str) or text == "":
             return "empty"
@@ -502,6 +643,9 @@ class Pusher(threading.Thread):
                 self._deliver(peer, payload)
 
     def _deliver(self, peer: dict, payload: dict) -> None:
+        if not peer_flag(peer, "push"):
+            log.debug("已禁止向 %s 推送，跳过", peer_key(peer))
+            return
         url = peer_base(peer) + "/api/clip"
         key = peer_key(peer)
         last_err = ""
@@ -512,6 +656,13 @@ class Pusher(threading.Thread):
                 log.debug("推送到 %s 成功", key)
                 return
             except urllib.error.HTTPError as exc:
+                if exc.code == 403:
+                    # 对方把我们设成了禁止接收，不必重试
+                    self.core.peer_state[key] = {
+                        "ok": False, "err": "对方已禁止接收", "ts": int(time.time()),
+                    }
+                    log.info("推送到 %s 被拒：对方已禁止接收本机内容", key)
+                    return
                 last_err = f"HTTP {exc.code}"
                 if exc.code in (401, 403):
                     break
@@ -575,6 +726,23 @@ def poller_loop(core: Core) -> None:
 CORE: Core | None = None
 SERVER = None
 TRAY = None
+
+
+def _peer_rows() -> list[dict]:
+    """对端列表（含收发策略），状态与批量操作共用。"""
+    return [
+        {
+            "key": peer_key(p),
+            "name": p.get("name"),
+            "host": p.get("host"),
+            "port": p.get("port"),
+            "mutual": bool(p.get("mutual")),
+            "push": peer_flag(p, "push"),
+            "recv": peer_flag(p, "recv"),
+            "state": CORE.peer_state.get(peer_key(p), {}),
+        }
+        for p in (CORE.cfg.get("peers") or [])
+    ]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -723,6 +891,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json(200, {"ok": ok, "peers": len(CORE.cfg.get("peers") or [])})
         if path.path == "/api/firewall":
             return self._json(200, fw_check())
+        if path.path == "/api/update":
+            cfg = CORE.cfg
+            return self._json(
+                200,
+                {
+                    "ok": True,
+                    "current": VERSION,
+                    "latest": cfg.get("update_last_version", ""),
+                    "auto_update": bool(cfg.get("auto_update", True)),
+                    "last_check": int(cfg.get("update_last_check") or 0),
+                    "interval_h": float(cfg.get("update_interval_h") or 6),
+                    "repo": GITHUB_REPO,
+                    "url": f"https://github.com/{GITHUB_REPO}/releases/latest",
+                },
+            )
         if path.path == "/api/shutdown":
             self._json(200, {"ok": True})
             threading.Thread(target=_shutdown, daemon=True).start()
@@ -738,7 +921,11 @@ class Handler(BaseHTTPRequestHandler):
             body = self._body()
             if not isinstance(body, dict):
                 return self._json(400, {"ok": False, "error": "bad_json"})
-            res = CORE.apply_remote(body)
+            src = (self.client_address[0] if self.client_address else "") or ""
+            res = CORE.apply_remote(body, src=src)
+            if res == "blocked":
+                return self._json(403, {"ok": False, "result": res,
+                                        "error": "本机已把该对端设为禁止接收"})
             code = 200 if res in ("ok", "same", "dup", "paused") else 400
             return self._json(code, {"ok": res in ("ok", "same", "dup", "paused"), "result": res})
 
@@ -905,6 +1092,54 @@ class Handler(BaseHTTPRequestHandler):
                 log.info("解绑已通知对端 %s（移除 %s 个）", peer_key(target), told.get("removed", 0))
             return self._json(200, {"ok": n > 0, "removed": n, "notify": told})
 
+        if path == "/api/peers/batch":
+            """对端批量操作：禁止接收 / 禁止推送 / 全禁止 / 恢复 / 解绑。"""
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            action = str(body.get("action") or "").strip().lower()
+            keys = body.get("keys")
+            keys = [str(k) for k in keys] if isinstance(keys, list) else (
+                [str(keys)] if keys else [])
+            sel = peers_select(CORE.cfg, keys)
+            if not sel:
+                return self._json(400, {"ok": False, "error": "没有匹配的对端"})
+
+            if action in ("unbind", "remove"):
+                notify = bool(body.get("notify", True))
+                targets = remove_peers(CORE.cfg, keys)
+                CORE.reload()
+                told = 0
+                for p in targets:
+                    if notify:
+                        r = reverse_unbind(CORE.cfg, p)
+                        told += int(r.get("removed") or 0)
+                log.info("批量解绑 %d 个对端（对方移除 %d 个）", len(targets), told)
+                return self._json(200, {"ok": True, "action": "unbind",
+                                        "removed": len(targets), "remote_removed": told,
+                                        "keys": [peer_key(p) for p in targets]})
+
+            mapping = {
+                "allow_push": {"push": True},
+                "deny_push": {"push": False},
+                "allow_recv": {"recv": True},
+                "deny_recv": {"recv": False},
+                "deny_all": {"push": False, "recv": False},
+                "allow_all": {"push": True, "recv": True},
+            }
+            flags = mapping.get(action)
+            if flags is None:
+                custom = body.get("flags")
+                if isinstance(custom, dict):
+                    flags = {k: bool(custom[k]) for k in ("push", "recv") if k in custom}
+            if not flags:
+                return self._json(400, {"ok": False, "error": "不支持的动作：" + (action or "(空)")})
+            hit = set_peer_policy(CORE.cfg, keys, **flags)
+            CORE.reload()
+            log.info("批量设置对端策略 %s → %d 个：%s", action, len(hit), ", ".join(hit))
+            return self._json(200, {"ok": True, "action": action, "updated": sorted(hit),
+                                    "peers": _peer_rows()})
+
         if path == "/api/pause":
             body = self._body()
             if not isinstance(body, dict):
@@ -988,6 +1223,52 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/reload":
             ok = CORE.reload()
             return self._json(200, {"ok": ok, "peers": len(CORE.cfg.get("peers") or [])})
+        if path == "/api/update":
+            """自动更新：check=只检查；apply=检查并升级；auto_update=改开关。"""
+            body = self._body()
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "参数错误"})
+            if "auto_update" in body:
+                CORE.cfg["auto_update"] = bool(body["auto_update"])
+                save_config(CORE.cfg)
+                log.info("自动更新已%s", "开启" if CORE.cfg["auto_update"] else "关闭")
+            if "interval_h" in body:
+                try:
+                    CORE.cfg["update_interval_h"] = max(0.5, float(body["interval_h"]))
+                    save_config(CORE.cfg)
+                except (TypeError, ValueError):
+                    pass
+            action = str(body.get("action") or "check").lower()
+            if action not in ("check", "apply"):
+                return self._json(
+                    200,
+                    {
+                        "ok": True,
+                        "current": VERSION,
+                        "latest": CORE.cfg.get("update_last_version", ""),
+                        "auto_update": bool(CORE.cfg.get("auto_update", True)),
+                        "last_check": int(CORE.cfg.get("update_last_check") or 0),
+                    },
+                )
+            force = bool(body.get("force", True))
+            res = update_now(CORE.cfg, force=force, install=(action == "apply"))
+            out = {
+                "ok": bool(res.get("ok")),
+                "current": VERSION,
+                "latest": (res.get("info") or {}).get("latest") or CORE.cfg.get(
+                    "update_last_version", ""),
+                "newer": bool((res.get("info") or {}).get("newer")),
+                "updated": bool(res.get("updated")),
+                "pending": bool(res.get("pending")),
+                "message": res.get("message") or res.get("error") or "",
+                "error": res.get("error") or "",
+                "url": (res.get("info") or {}).get("url") or "",
+                "notes": (res.get("info") or {}).get("notes") or "",
+                "auto_update": bool(CORE.cfg.get("auto_update", True)),
+                "last_check": int(CORE.cfg.get("update_last_check") or 0),
+            }
+            return self._json(200 if out["ok"] else 409, out)
+
         if path == "/api/shutdown":
             self._json(200, {"ok": True})
             threading.Thread(target=_shutdown, daemon=True).start()
@@ -1010,17 +1291,7 @@ class Handler(BaseHTTPRequestHandler):
             "paused": bool(CORE.paused),
             "log_level": cfg.get("log_level", "info"),
             "autostart": autostart_installed(),
-            "peers": [
-                {
-                    "key": peer_key(p),
-                    "name": p.get("name"),
-                    "host": p.get("host"),
-                    "port": p.get("port"),
-                    "mutual": bool(p.get("mutual")),
-                    "state": CORE.peer_state.get(peer_key(p), {}),
-                }
-                for p in cfg.get("peers") or []
-            ],
+            "peers": _peer_rows(),
             "firewall": {
                 "open": bool(fw_managed(int(cfg["port"]))),
                 "mode": (fw_managed(int(cfg["port"])) or {}).get("mode", cfg.get("fw_mode", "temp")),
@@ -1028,6 +1299,14 @@ class Handler(BaseHTTPRequestHandler):
                 "autocheck": bool(cfg.get("fw_autocheck", True)),
                 "autoopen": bool(cfg.get("fw_autoopen", False)),
                 "fw_mode": cfg.get("fw_mode", "temp"),
+            },
+            "update": {
+                "current": VERSION,
+                "latest": cfg.get("update_last_version", ""),
+                "auto_update": bool(cfg.get("auto_update", True)),
+                "last_check": int(cfg.get("update_last_check") or 0),
+                "interval_h": float(cfg.get("update_interval_h") or 6),
+                "repo": GITHUB_REPO,
             },
             "push_count": CORE.push_count,
             "recv_count": CORE.recv_count,
@@ -1221,6 +1500,353 @@ def notify_reload(cfg: dict) -> bool:
 
 
 # --------------------------------------------------------------------------
+# 自动更新：与 GitHub Release 同步
+# --------------------------------------------------------------------------
+# 流程：查 release/latest → 挑适合本平台的产物 → 下载 → 解压 → 替换 → 重启。
+# Windows 上正在运行的 exe 不能自我覆盖，所以生成一个批处理等进程退出后再替换。
+def version_tuple(v: str) -> tuple:
+    nums = re.findall(r"\d+", str(v or ""))
+    return tuple(int(n) for n in nums[:4]) or (0,)
+
+
+def _update_opener():
+    """访问 GitHub 走系统代理（环境变量 http_proxy / https_proxy）。"""
+    return urllib.request.build_opener()
+
+
+def update_pick_asset(rel: dict) -> dict:
+    """按当前运行形态挑选发布包：打包版取二进制，源码版取源码压缩包。"""
+    assets = rel.get("assets") or []
+    if is_frozen():
+        want_ext, want_kw = (".zip", "windows") if IS_WIN else (".tar.gz", "linux")
+        for a in assets:
+            name = str(a.get("name") or "")
+            low = name.lower()
+            if want_kw in low and low.endswith(want_ext):
+                return {"name": name, "url": a.get("browser_download_url") or "",
+                        "kind": "binary", "size": a.get("size") or 0}
+        return {}
+    tag = str(rel.get("tag_name") or "")
+    if not tag:
+        return {}
+    return {
+        "name": f"{GITHUB_REPO}-{tag}-source.zip",
+        "url": UPDATE_ZIPBALL.format(repo=GITHUB_REPO, tag=tag),
+        "kind": "source",
+        "size": 0,
+    }
+
+
+def update_check(timeout: float = 15.0) -> dict:
+    """查询仓库最新 Release。不写配置、不做任何修改。"""
+    out = {
+        "ok": False, "current": VERSION, "latest": "", "newer": False, "tag": "",
+        "url": "", "notes": "", "published_at": "", "asset": "", "download_url": "",
+        "kind": "", "error": "", "prerelease": False,
+    }
+    try:
+        req = urllib.request.Request(
+            UPDATE_API,
+            headers={"Accept": "application/vnd.github+json",
+                     "User-Agent": f"ClipShare/{VERSION}"},
+        )
+        with _update_opener().open(req, timeout=timeout) as r:
+            rel = json.loads(r.read().decode("utf-8") or "{}")
+    except Exception as exc:
+        out["error"] = f"{type(exc).__name__}: {exc}"
+        return out
+    tag = str(rel.get("tag_name") or "")
+    latest = tag.lstrip("vV") or str(rel.get("name") or "")
+    out.update(
+        {
+            "ok": True,
+            "tag": tag,
+            "latest": latest,
+            "url": rel.get("html_url") or "",
+            "notes": (rel.get("body") or "")[:2000],
+            "published_at": rel.get("published_at") or "",
+            "prerelease": bool(rel.get("prerelease")),
+        }
+    )
+    out["newer"] = version_tuple(latest) > version_tuple(VERSION)
+    pick = update_pick_asset(rel)
+    out["asset"] = pick.get("name") or ""
+    out["download_url"] = pick.get("url") or ""
+    out["kind"] = pick.get("kind") or ""
+    if out["newer"] and not pick:
+        out["error"] = "发布包里没有适合本平台的产物"
+    return out
+
+
+def update_download(url: str, timeout: float = 180.0) -> dict:
+    os.makedirs(UPDATE_DIR, exist_ok=True)
+    name = os.path.basename(urllib.parse.urlparse(url).path) or "update.bin"
+    dst = os.path.join(UPDATE_DIR, name)
+    tmp = dst + ".part"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": f"ClipShare/{VERSION}"})
+        with _update_opener().open(req, timeout=timeout) as r, open(tmp, "wb") as f:
+            shutil.copyfileobj(r, f, 256 * 1024)
+        os.replace(tmp, dst)
+        return {"ok": True, "path": dst, "size": os.path.getsize(dst)}
+    except Exception as exc:
+        try:
+            os.remove(tmp)
+        except Exception:
+            pass
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+
+
+def _safe_extract(archive, dest: str) -> None:
+    """解压并挡掉 ../ 与绝对路径（发布包来自网络，不当作可信输入）。"""
+    members = []
+    for m in archive.namelist() if hasattr(archive, "namelist") else []:
+        name = str(m).replace("\\", "/")
+        if name.startswith("/") or ".." in name.split("/"):
+            continue
+        members.append(m)
+    archive.extractall(dest, members=members)
+
+
+def update_extract(path: str) -> dict:
+    stage = os.path.join(UPDATE_DIR, "staging")
+    try:
+        shutil.rmtree(stage)
+    except Exception:
+        pass
+    os.makedirs(stage, exist_ok=True)
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                _safe_extract(z, stage)
+        elif tarfile.is_tarfile(path):
+            with tarfile.open(path) as t:
+                _safe_extract(t, stage)
+        else:
+            return {"ok": False, "error": f"不认识的发布包格式：{os.path.basename(path)}"}
+    except Exception as exc:
+        return {"ok": False, "error": f"解压失败：{exc}"}
+    files = []
+    for root, _dirs, names in os.walk(stage):
+        for n in names:
+            files.append(os.path.join(root, n))
+    return {"ok": bool(files), "dir": stage, "files": files,
+            "error": "" if files else "发布包里没有文件"}
+
+
+def update_plan(stage_dir: str) -> dict:
+    """决定要把哪些文件替换到哪儿。"""
+    wanted = (
+        {"ClipShare.exe", "clipshare-cli.exe"} if IS_WIN else {"clipshare", "ClipShare"}
+    ) if is_frozen() else {"clipshare.py", "gui.py", "webui.py", "README.md"}
+    dest_dir = (
+        os.path.dirname(sys.executable)
+        if is_frozen()
+        else os.path.dirname(os.path.abspath(__file__))
+    )
+    found: dict[str, str] = {}
+    for root, _dirs, names in os.walk(stage_dir):
+        for n in names:
+            if n in wanted and n not in found:
+                found[n] = os.path.join(root, n)
+    plan = [(found[n], os.path.join(dest_dir, n)) for n in wanted if n in found]
+    mode = "source"
+    if is_frozen():
+        mode = "frozen-win" if IS_WIN else "frozen-posix"
+    return {"ok": bool(plan), "mode": mode, "plan": plan,
+            "error": "" if plan else f"发布包里没找到需要的文件（{', '.join(sorted(wanted))}）"}
+
+
+def _win_write_updater(plan: list, pid: int, restart_cmd: list[str]) -> str:
+    """生成替换自身的批处理：等进程退出 → 覆盖 exe → 重新启动 → 自删。"""
+    bat = os.path.join(UPDATE_DIR, "apply_update.bat")
+    lines = [
+        "@echo off",
+        "chcp 65001 >nul",
+        f'set "PID={pid}"',
+        ":wait",
+        'tasklist /FI "PID eq %PID%" /NH 2>nul | findstr /C:"%PID%" >nul',
+        "if errorlevel 1 goto doit",
+        "ping -n 2 127.0.0.1 >nul",
+        "goto wait",
+        ":doit",
+    ]
+    for src, dst in plan:
+        lines.append(f'copy /Y "{src}" "{dst}" >nul')
+    if restart_cmd:
+        args = " ".join(f'"{a}"' for a in restart_cmd[1:])
+        lines.append(f'start "" "{restart_cmd[0]}" {args}')
+    lines.append('del "%~f0"')
+    with open(bat, "w", encoding="utf-8", newline="\r\n") as f:
+        f.write("\n".join(lines) + "\n")
+    return bat
+
+
+def _launch_detached(argv: list[str]) -> bool:
+    kwargs = {"cwd": os.path.dirname(argv[0]) or None}
+    if os.name == "nt":
+        kwargs["creationflags"] = 0x00000008 | 0x08000000  # DETACHED | NO_WINDOW
+        kwargs["stdin"] = subprocess.DEVNULL
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+    else:
+        kwargs["stdin"] = subprocess.DEVNULL
+        kwargs["stdout"] = subprocess.DEVNULL
+        kwargs["stderr"] = subprocess.DEVNULL
+        kwargs["start_new_session"] = True
+    try:
+        subprocess.Popen(argv, **kwargs)
+        return True
+    except Exception as exc:
+        log.warning("启动更新脚本失败: %s", exc)
+        return False
+
+
+def update_apply(plan: dict, restart_cmd: list[str] | None = None) -> dict:
+    """把解压出来的文件替换到运行位置。返回 need_exit / need_restart 指示调用方收尾。"""
+    mode = plan["mode"]
+    items = plan["plan"]
+    if mode == "source":
+        for src, dst in items:
+            try:
+                if os.path.exists(dst):
+                    shutil.copy2(dst, dst + ".bak")
+                shutil.copy2(src, dst)
+            except Exception as exc:
+                return {"ok": False, "mode": mode, "error": f"替换 {os.path.basename(dst)} 失败：{exc}"}
+        return {"ok": True, "mode": mode, "need_restart": True, "need_exit": False,
+                "files": [os.path.basename(d) for _s, d in items]}
+    if mode == "frozen-posix":
+        for src, dst in items:
+            try:
+                old = dst + ".old"
+                if os.path.exists(old):
+                    os.remove(old)
+                if os.path.exists(dst):
+                    os.rename(dst, old)  # 先挪走，避免覆盖正在执行的二进制
+                shutil.copy2(src, dst)
+                os.chmod(dst, 0o755)
+                if os.path.exists(old):
+                    os.remove(old)
+            except Exception as exc:
+                return {"ok": False, "mode": mode, "error": f"替换 {os.path.basename(dst)} 失败：{exc}"}
+        return {"ok": True, "mode": mode, "need_restart": True, "need_exit": False,
+                "files": [os.path.basename(d) for _s, d in items]}
+    # frozen-win：正在运行的 exe 无法自我覆盖，交给批处理
+    bat = _win_write_updater(items, os.getpid(), list(restart_cmd or []))
+    if not _launch_detached(["cmd.exe", "/c", bat]):
+        return {"ok": False, "mode": mode, "error": "无法启动更新脚本"}
+    return {"ok": True, "mode": mode, "need_restart": False, "need_exit": True,
+            "updater": bat, "files": [os.path.basename(d) for _s, d in items]}
+
+
+def default_restart_cmd() -> list[str]:
+    if is_frozen():
+        exe = daemon_exe() or sys.executable
+        return [exe, "gui", "--silent"]
+    return base_argv() + ["gui", "--silent"]
+
+
+def update_now(cfg: dict, force: bool = False, install: bool = True,
+               restart: bool = True, throttle_s: float = 1800.0) -> dict:
+    """检查 +（可选）下载安装。后台定时检查与手动点击共用。"""
+    last = float(cfg.get("update_last_check") or 0)
+    if not force and throttle_s > 0 and time.time() - last < throttle_s:
+        return {"ok": True, "updated": False, "skipped": True,
+                "info": {"latest": cfg.get("update_last_version", ""), "current": VERSION},
+                "message": f"刚刚检查过（{int(time.time() - last)} 秒前），跳过"}
+    info = update_check()
+    cfg["update_last_check"] = int(time.time())
+    if info.get("latest"):
+        cfg["update_last_version"] = info["latest"]
+    try:
+        save_config(cfg)
+    except Exception:
+        pass
+    if not info.get("ok"):
+        return {"ok": False, "stage": "check", "updated": False,
+                "error": info.get("error") or "检查更新失败", "info": info}
+    if not info.get("newer"):
+        return {"ok": True, "updated": False, "info": info,
+                "message": f"已是最新版 v{VERSION}"}
+    if not info.get("download_url"):
+        return {"ok": False, "stage": "asset", "updated": False,
+                "error": info.get("error") or "发布包里没有适合本平台的产物", "info": info}
+    if not install:
+        return {"ok": True, "updated": False, "pending": True, "info": info,
+                "message": f"发现新版 v{info['latest']}（未开启自动安装）"}
+
+    dl = update_download(info["download_url"])
+    if not dl.get("ok"):
+        return {"ok": False, "stage": "download", "updated": False,
+                "error": dl.get("error"), "info": info}
+    ex = update_extract(dl["path"])
+    if not ex.get("ok"):
+        return {"ok": False, "stage": "extract", "updated": False,
+                "error": ex.get("error"), "info": info}
+    plan = update_plan(ex["dir"])
+    if not plan.get("ok"):
+        return {"ok": False, "stage": "plan", "updated": False,
+                "error": plan.get("error"), "info": info}
+    # 服务在跑（托盘/后台）才需要更新后自启；纯命令行升级不主动拉起界面
+    res = update_apply(plan, default_restart_cmd() if SERVER is not None else None)
+    res["info"] = info
+    if not res.get("ok"):
+        res.update({"stage": "apply", "updated": False})
+        return res
+    res["updated"] = True
+    res["version"] = info["latest"]
+    # 给 HTTP 响应留出时间，再让当前进程退出 / 重启
+    was_running = SERVER is not None
+    if restart and was_running:
+        def finish():
+            time.sleep(1.2)
+            if res.get("need_restart"):
+                try:
+                    spawn_background()
+                except Exception as exc:
+                    log.warning("更新后重启失败: %s", exc)
+            _shutdown()
+        threading.Thread(target=finish, daemon=True, name="update-restart").start()
+        res["message"] = f"已更新到 v{info['latest']}，正在重启"
+    else:
+        res["message"] = f"已更新到 v{info['latest']}" + (
+            "" if was_running else "（下次启动生效）")
+    return res
+
+
+def update_watchdog(cfg: dict) -> None:
+    """后台定时检查更新：启动 30 秒后查一次，之后按 update_interval_h 循环。"""
+    time.sleep(30)
+    while True:
+        core = CORE
+        if core is None or core.stop_event.is_set():
+            return
+        try:
+            if bool(core.cfg.get("auto_update", True)):
+                res = update_now(core.cfg, throttle_s=float(
+                    core.cfg.get("update_interval_h") or 6) * 3600 * 0.5)
+                if res.get("updated"):
+                    log.info("自动更新：%s", res.get("message"))
+                elif res.get("pending"):
+                    log.info("发现新版 v%s，自动安装已关闭，可在设置面板手动升级",
+                             (res.get("info") or {}).get("latest"))
+                elif not res.get("ok") and not res.get("skipped"):
+                    log.debug("自动更新检查失败：%s", res.get("error"))
+        except Exception as exc:
+            log.debug("自动更新异常: %s", exc)
+        core = CORE
+        if core is None or core.stop_event.is_set():
+            return
+        interval = max(0.5, float(core.cfg.get("update_interval_h") or 6)) * 3600
+        for _ in range(int(min(interval, 24 * 3600))):
+            core = CORE
+            if core is None or core.stop_event.is_set():
+                return
+            time.sleep(1)
+
+
+# --------------------------------------------------------------------------
 # 配对链接
 # --------------------------------------------------------------------------
 LINK_RE = re.compile(
@@ -1267,6 +1893,60 @@ def upsert_peer(cfg: dict, peer: dict) -> bool:
     peers.append(peer)
     save_config(cfg)
     return False
+
+
+# ---- 对端收发策略：每个对端可单独禁止推送 / 禁止接收 ----
+def peer_flag(p: dict, key: str, default: bool = True) -> bool:
+    """读取对端的 push / recv 开关；缺省视为允许。"""
+    v = p.get(key)
+    if v is None:
+        return default
+    if isinstance(v, str):
+        return v.strip().lower() not in ("0", "false", "off", "no", "否", "禁用", "禁止")
+    return bool(v)
+
+
+def match_peer(p: dict, key: str) -> bool:
+    key = (key or "").strip()
+    if not key:
+        return False
+    return key in (
+        str(p.get("name") or ""),
+        str(p.get("host") or ""),
+        peer_key(p),
+        f"{p.get('name')}@{peer_key(p)}",
+    )
+
+
+def peers_select(cfg: dict, keys: list | None) -> list[dict]:
+    """按名称 / IP / IP:端口选出对端；keys 为空表示全部。"""
+    peers = list(cfg.get("peers") or [])
+    ks = [str(k).strip() for k in (keys or []) if str(k).strip()]
+    if not ks:
+        return peers
+    return [p for p in peers if any(match_peer(p, k) for k in ks)]
+
+
+def set_peer_policy(cfg: dict, keys: list | None, **flags) -> list[str]:
+    """批量设置 push / recv 开关，返回受影响的对端 key。"""
+    hit = []
+    for p in peers_select(cfg, keys):
+        p.update(flags)
+        hit.append(peer_key(p))
+    if hit:
+        save_config(cfg)
+    return hit
+
+
+def remove_peers(cfg: dict, keys: list | None) -> list[dict]:
+    """批量解绑，返回被删掉的对端（供调用方通知对方）。"""
+    targets = peers_select(cfg, keys)
+    if not targets:
+        return []
+    keyset = {peer_key(p) for p in targets}
+    cfg["peers"] = [p for p in (cfg.get("peers") or []) if peer_key(p) not in keyset]
+    save_config(cfg)
+    return targets
 
 
 def remove_peer(cfg: dict, key: str) -> int:
@@ -2239,6 +2919,9 @@ def cmd_start(cfg: dict) -> int:
 def cmd_run(args, cfg: dict) -> int:
     global CORE, SERVER
     clipboard()  # 平台不支持时在这里给出明确提示
+    got, owner = instance_lock_acquire(cfg)
+    if not got:
+        return other_instance_running(cfg, owner, bool(args.silent))
     try:
         SERVER, port, note = bind_with_fallback(cfg)
     except OSError as exc:
@@ -2252,6 +2935,9 @@ def cmd_run(args, cfg: dict) -> int:
     CORE.pusher.start()
     threading.Thread(target=poller_loop, args=(CORE,), daemon=True, name="poller").start()
     fw_startup_housekeeping()  # 回收上次闪退遗留的防火墙规则 + 注册退出自动恢复
+    if cfg.get("auto_update", True):
+        threading.Thread(target=update_watchdog, args=(cfg,), daemon=True,
+                         name="updater").start()
 
     if note and not args.silent:
         print(note)
@@ -2271,6 +2957,7 @@ def cmd_run(args, cfg: dict) -> int:
         CORE.stop_event.set()
         _stop_server(SERVER)
         fw_cleanup_all("服务停止")
+        instance_lock_release()
         log.info("已停止")
     return 0
 
@@ -2513,6 +3200,30 @@ def _toggle_firewall() -> str:
     return f"放行失败：{res.get('error')}"
 
 
+def _update_label() -> str:
+    """托盘菜单文案：有新版时直接显示「更新到 vX」。"""
+    latest = str(CORE.cfg.get("update_last_version") or "")
+    if latest and version_tuple(latest) > version_tuple(VERSION):
+        return f"更新到 v{latest}（当前 v{VERSION}）"
+    return "检查更新…"
+
+
+def _do_update() -> str:
+    """托盘点一下：先查，发现新版就按开关决定是否直接装。"""
+    install = bool(CORE.cfg.get("auto_update", True))
+    res = update_now(CORE.cfg, force=True, install=install)
+    if res.get("updated"):
+        return res.get("message") or "已更新"
+    info = res.get("info") or {}
+    if res.get("pending"):
+        return (f"发现新版 v{info.get('latest')}（当前 v{VERSION}）"
+                " —— 自动安装已关闭，可在设置面板手动升级")
+    if not res.get("ok"):
+        return f"检查更新失败：{res.get('error')}"
+    return (f"已是最新版 v{VERSION}"
+            if not info.get("newer") else (res.get("message") or "检查完成"))
+
+
 def _copy_my_link() -> str:
     link = build_link(CORE.cfg)
     try:
@@ -2534,11 +3245,15 @@ def _open_log_file() -> None:
 
 def cmd_gui(args, cfg: dict) -> int:
     global TRAY
+    got, owner = instance_lock_acquire(cfg)
+    if not got:
+        return other_instance_running(cfg, owner, bool(getattr(args, "silent", False)))
     if service_alive(cfg):
         url = open_settings(cfg)
         log.info("已有实例在运行，打开设置面板 %s", url)
         if not getattr(args, "silent", False):
             print(f"服务已在运行，已打开设置面板：{url}")
+        instance_lock_release()
         return 0
 
     try:
@@ -2560,6 +3275,9 @@ def cmd_gui(args, cfg: dict) -> int:
         cfg["port"],
         len(cfg.get("peers") or []),
     )
+    if cfg.get("auto_update", True):
+        threading.Thread(target=update_watchdog, args=(cfg,), daemon=True,
+                         name="updater").start()
 
     try:
         import gui  # 同目录模块
@@ -2601,6 +3319,8 @@ def cmd_gui(args, cfg: dict) -> int:
                             + ("（点击恢复）" if fw_managed(int(CORE.cfg["port"])) else "（点击放行）"),
         "fw_open": lambda: bool(fw_managed(int(CORE.cfg["port"]))),
         "toggle_fw": _toggle_firewall,
+        "update_label": _update_label,
+        "do_update": _do_update,
     }
     app = gui.TrayApp(hooks)
     TRAY = app.icon
@@ -2614,6 +3334,7 @@ def cmd_gui(args, cfg: dict) -> int:
             server.server_close()
         except Exception:
             pass
+        instance_lock_release()
     return 0
 
 
@@ -2839,17 +3560,123 @@ def cmd_peers(args, cfg: dict) -> int:
     if not peers:
         print("尚未绑定任何对端。先在本机 link 生成链接，到对端 bind。")
         return 0
-    print(f"{'名称':<18}{'地址':<26}{'令牌':<10}状态")
+    print(f"{'名称':<18}{'地址':<24}{'推送':<6}{'接收':<6}状态")
     for p in peers:
         addr = f"{host_for_url(str(p['host']))}:{p['port']}"
-        tok = (p.get("token") or "")[:8] + "…"
         try:
             http_json(peer_base(p) + "/api/ping", token=p.get("token", ""), timeout=3)
             st = "○ 正常"
         except Exception as exc:
             st = f"× {type(exc).__name__}"
-        print(f"{str(p.get('name')):<18}{addr:<26}{tok:<10}{st}")
+        push = "开" if peer_flag(p, "push") else "禁"
+        recv = "开" if peer_flag(p, "recv") else "禁"
+        print(f"{str(p.get('name')):<18}{addr:<24}{push:<6}{recv:<6}{st}")
+    print("\n策略调整：clipshare policy <名称/IP> --push off|on --recv off|on"
+          " | --deny-all | --allow-all | --unbind")
     return 0
+
+
+def cmd_policy(args, cfg: dict) -> int:
+    """对端批量策略：禁止接收 / 禁止推送 / 全禁止 / 恢复 / 解绑。"""
+    keys = list(args.targets or [])
+    action = ""
+    if getattr(args, "deny_all", False):
+        action = "deny_all"
+    elif getattr(args, "allow_all", False):
+        action = "allow_all"
+    elif getattr(args, "unbind", False):
+        action = "unbind"
+    flags = {}
+    if getattr(args, "push", None) == "off":
+        flags["push"] = False
+    elif getattr(args, "push", None) == "on":
+        flags["push"] = True
+    if getattr(args, "recv", None) == "off":
+        flags["recv"] = False
+    elif getattr(args, "recv", None) == "on":
+        flags["recv"] = True
+    if not action and not flags:
+        print("请指定动作：--push on|off、--recv on|off、--deny-all、--allow-all、--unbind")
+        return 2
+
+    if service_alive(cfg):
+        body: dict = {"keys": keys}
+        if action:
+            body["action"] = action
+        else:
+            body["action"] = "policy"
+            body["flags"] = flags
+        try:
+            _, res = service_call(cfg, "/api/peers/batch", body, timeout=15)
+        except Exception as exc:
+            print(f"调用服务失败：{exc}")
+            return 1
+        if not res.get("ok"):
+            print(f"失败：{res.get('error')}")
+            return 1
+        if action == "unbind":
+            print(f"已解绑 {res.get('removed', 0)} 个（对方移除 {res.get('remote_removed', 0)} 个）")
+        else:
+            print(f"已更新 {len(res.get('updated') or [])} 个对端：" + ", ".join(res.get("updated") or []))
+        return 0
+
+    # 服务没在跑：直接改配置文件
+    sel = peers_select(cfg, keys)
+    if not sel:
+        print("没有匹配的对端" + (f"（{', '.join(keys)}）" if keys else ""))
+        return 1
+    if action == "unbind":
+        targets = remove_peers(cfg, keys)
+        told = 0
+        for p in targets:
+            r = reverse_unbind(cfg, p)
+            told += int(r.get("removed") or 0)
+        print(f"已解绑 {len(targets)} 个对端（对方移除 {told} 个）")
+    else:
+        use = dict(flags)
+        if action == "deny_all":
+            use = {"push": False, "recv": False}
+        elif action == "allow_all":
+            use = {"push": True, "recv": True}
+        hit = set_peer_policy(cfg, keys, **use)
+        print(f"已更新 {len(hit)} 个对端：" + ", ".join(hit))
+    print("提示：服务未运行，配置已保存，下次启动生效。")
+    return 0
+
+
+def cmd_update(args, cfg: dict) -> int:
+    """手动检查 / 安装 GitHub Release 上的新版。"""
+    if getattr(args, "off", False):
+        cfg["auto_update"] = False
+        save_config(cfg)
+        print("已关闭自动更新（只保留手动检查）")
+        return 0
+    if getattr(args, "on", False):
+        cfg["auto_update"] = True
+        save_config(cfg)
+        print("已开启自动更新")
+        return 0
+    apply_now = bool(getattr(args, "apply", False))
+    res = update_now(cfg, force=True, install=apply_now, restart=False)
+    info = res.get("info") or {}
+    if not res.get("ok"):
+        print(f"检查更新失败：{res.get('error')}")
+        return 1
+    print(f"当前版本    : v{VERSION}   仓库：{GITHUB_REPO}")
+    print(f"最新版本    : v{info.get('latest') or '?'}   发布页：{info.get('url')}")
+    if res.get("updated"):
+        print(f"已完成      : {res.get('message')}")
+        return 0
+    if not info.get("newer"):
+        print("结论        : 已是最新版")
+        return 0
+    if not apply_now:
+        print("结论        : 有新版本，加 --apply 立即下载安装")
+        if info.get("notes"):
+            print("\n更新说明：\n" + info["notes"][:800])
+        return 0
+    print(f"未完成      : {res.get('message') or res.get('error')}")
+    return 1
 
 
 def cmd_send(args, cfg: dict) -> int:
@@ -2932,6 +3759,9 @@ def cmd_config(args, cfg: dict) -> int:
         dirty = True
     if getattr(args, "port_auto", None) is not None:
         cfg["port_auto"] = bool(args.port_auto)
+        dirty = True
+    if getattr(args, "auto_update", None) is not None:
+        cfg["auto_update"] = bool(args.auto_update)
         dirty = True
     if args.max_kb:
         cfg["max_kb"] = int(args.max_kb)
@@ -3042,6 +3872,21 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--pid", type=int, help=argparse.SUPPRESS)  # UAC 提权子进程用
     s.set_defaults(fn=cmd_fw)
 
+    s = sub.add_parser("policy", help="对端收发策略（可多选）：禁止推送 / 禁止接收 / 全禁止 / 解绑")
+    s.add_argument("targets", nargs="*", help="对端名称 / IP / IP:端口；不填=全部")
+    s.add_argument("--push", choices=["on", "off"], help="允许 / 禁止向这些对端推送")
+    s.add_argument("--recv", choices=["on", "off"], help="允许 / 禁止接收这些对端的内容")
+    s.add_argument("--deny-all", dest="deny_all", action="store_true", help="全部禁止（不推也不收）")
+    s.add_argument("--allow-all", dest="allow_all", action="store_true", help="恢复双向收发")
+    s.add_argument("--unbind", dest="unbind", action="store_true", help="批量解绑")
+    s.set_defaults(fn=cmd_policy)
+
+    s = sub.add_parser("update", help="与 GitHub Release 同步：检查 / 升级 / 开关自动更新")
+    s.add_argument("--apply", dest="apply", action="store_true", help="发现新版就直接下载安装")
+    s.add_argument("--on", dest="on", action="store_true", help="开启自动更新")
+    s.add_argument("--off", dest="off", action="store_true", help="关闭自动更新（仍可手动检查）")
+    s.set_defaults(fn=cmd_update)
+
     sub.add_parser("peers", help="列出并对端做连通性探测").set_defaults(fn=cmd_peers)
 
     s = sub.add_parser("send", help="写入本机剪贴板并推送")
@@ -3071,6 +3916,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--max-kb", dest="max_kb", type=int)
     s.add_argument("--poll-ms", dest="poll_ms", type=int)
     s.add_argument("--new-token", dest="new_token", action="store_true")
+    s.add_argument("--auto-update", dest="auto_update", action="store_true", default=None,
+                   help="开启自动检查并同步 GitHub Release")
+    s.add_argument("--no-auto-update", dest="auto_update", action="store_false",
+                   help="关闭自动更新")
     s.set_defaults(fn=cmd_config)
 
     s = sub.add_parser("gui", help="启动托盘界面（不带参数运行时默认执行）")

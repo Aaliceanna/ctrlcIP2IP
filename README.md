@@ -11,6 +11,9 @@
 - **自动防回环**、**配置热加载**、**开机自启**（Windows 注册表 / Linux systemd）
 - **绑定即双向**：A 绑了 B，B 的对端列表里会自动出现 A；解绑也会通知对方一起删掉
 - **防火墙一键放行**：面板里点一下就开端口，**软件关闭 / 闪退 / 被强杀后自动恢复**，不留洞口
+- **单一实例**：同一台机器只会有一个 ClipShare 在跑，重复双击不会起第二个（会直接打开已经在跑的那个的设置面板）
+- **自动更新**：每 6 小时查一次 GitHub Release，有新版就下载安装并自动重启；也可以关掉自动，只在面板里手动点
+- **对端单独管控**：每个对端都能单独「禁止推送 / 禁止接收 / 全禁止」，可勾选多个批量操作批量解绑
 
 > **怎么关？** 右键托盘图标 → **退出 ClipShare**。命令行也能 `clipshare-cli.exe stop`。
 > **怎么绑 IP？** 托盘右键 →「打开设置面板」，粘贴对端配对链接即可（或手动填 IP + 端口 + 令牌）。
@@ -57,6 +60,7 @@ sudo apt install wl-clipboard   # Wayland
 | 防火墙放行 TCP xxxx | 一键开端口（临时规则，退出自动恢复）；已放行时点击即恢复 |
 | 打开日志文件 | 用记事本打开日志 |
 | 开机自启 | 勾选后随登录自动启动 |
+| 检查更新… / 更新到 vX | 点一下查新版，有新版时直接下载安装并重启 |
 | 退出 ClipShare | 完全退出（图标消失、端口和防火墙规则一起释放） |
 
 ### 防火墙：检测 + 一键放行 + 自动恢复
@@ -93,6 +97,56 @@ clipshare-cli.exe fw --close --all                     :: 恢复（撤销全部�
 ```bat
 netsh advfirewall firewall add rule name="ClipShare 8765" dir=in action=allow protocol=TCP localport=8765
 ```
+
+### 单一实例
+
+同一配置目录只允许一个 ClipShare 运行。已经在跑的时候再双击 `ClipShare.exe`：
+
+- 不会起第二个进程，也不会出现「端口被占用」的报错
+- 直接把已经在跑的那个的设置面板打开（开机自启模式下不弹浏览器，只记日志）
+
+判定靠两样东西：锁文件（记 PID、端口、令牌）和 Windows 命名互斥量。进程被强杀后锁会被自动接管，不会把程序锁死在外面。
+
+### 自动更新
+
+设置面板「更新」卡片：
+
+- **立即检查**：查 GitHub 上 `Aaliceanna/ctrlcIP2IP` 的最新 Release，显示版本号和更新时间
+- **升级到 vX**：下载对应平台的发布包 → 替换本机程序 → 自动重启（约 2 秒）
+- 勾选「自动检查并安装更新」后每 6 小时自动做一次上面的事，托盘菜单会变成「更新到 vX」
+
+Windows 上正在运行的 exe 不能自我覆盖，所以实际流程是：下载 → 生成一个临时批处理 → 当前进程退出 → 批处理覆盖 exe 并重新拉起程序。源码运行的版本则直接替换 `clipshare.py` / `gui.py` / `webui.py`（旧的会留一份 `.bak`）。
+
+```bat
+clipshare-cli.exe update            :: 只检查
+clipshare-cli.exe update --apply    :: 下载安装（不会自动拉起界面）
+clipshare-cli.exe update --off      :: 关掉自动更新（仍可手动检查）
+```
+
+### 对端单独管控（禁止推送 / 禁止接收 / 批量解绑）
+
+面板「已绑定对端」里每行前面有复选框，勾上之后点上面的按钮即可批量操作：
+
+| 按钮 | 效果 |
+|---|---|
+| 禁止推送 | 本机 Ctrl+C 的内容**不发给**这些对端 |
+| 禁止接收 | 这些对端推过来的内容**不写进**本机剪贴板 |
+| 全禁止 | 两个方向都关 |
+| 恢复收发 | 两个方向都开 |
+| 解绑 | 批量删除（同时通知对方把本机也删掉） |
+
+命令行（服务没在跑时直接改配置文件）：
+
+```bat
+clipshare-cli.exe policy PC-B --push off      :: 不给它推
+clipshare-cli.exe policy PC-B --recv off      :: 不收它的
+clipshare-cli.exe policy PC-B --deny-all      :: 双向全禁
+clipshare-cli.exe policy PC-B --allow-all     :: 恢复
+clipshare-cli.exe policy PC-B PC-C --unbind   :: 批量解绑（多个目标）
+clipshare-cli.exe peers                       :: 列表里会显示每台机器的推送/接收状态
+```
+
+> 被对方设成「禁止接收」时，推送方会在对端状态里看到「对方已禁止接收」，不会反复重试。
 
 ---
 
@@ -131,6 +185,8 @@ loginctl enable-linger $USER   # 未登录也常驻（可选）
 | `clipshare fw` | 防火墙体检：是否开启、端口是否放行、服务是否在监听 |
 | `clipshare fw --open [--mode persist]` | 一键放行端口（默认临时规则，退出自动恢复） |
 | `clipshare fw --close [--all]` | 撤销放行规则 |
+| `clipshare policy <名称/IP>… --push off --recv off --deny-all --allow-all --unbind` | 对端收发策略与批量解绑 |
+| `clipshare update [--apply] [--on] [--off]` | 与 GitHub Release 同步：检查 / 升级 / 开关自动更新 |
 | `clipshare stop` / `restart` | 停止 / 重启 |
 | `clipshare config --port 8766` | 改端口（服务在跑时**立即生效**，不用重启） |
 | `clipshare config --bind 192.168.2.65` | 只在这块网卡监听 |
@@ -205,21 +261,28 @@ clipshare-cli.exe config --no-port-auto
   "advertise": "",
   "port_auto": true,
   "token": "32位随机令牌",
-  "peers": [{ "name": "PC-B", "host": "192.168.1.184", "port": 8765, "token": "对方令牌", "mutual": true }],
+  "peers": [{ "name": "PC-B", "host": "192.168.1.184", "port": 8765, "token": "对方令牌",
+              "mutual": true, "push": true, "recv": true }],
   "max_kb": 512,
   "poll_ms": 200,
   "log_level": "info",
   "fw_autocheck": true,
   "fw_autoopen": false,
-  "fw_mode": "temp"
+  "fw_mode": "temp",
+  "auto_update": true,
+  "update_interval_h": 6
 }
 ```
 
-`mutual: true` 表示对方也绑定了本机（双向互通）。
+`mutual: true` 表示对方也绑定了本机（双向互通）；`push` / `recv` 是收发开关，缺省即允许，设成 `false` 就是禁止推送 / 禁止接收。
 防火墙三项：`fw_autocheck` 绑定时是否做体检、`fw_autoopen` 被拦截时是否不问就直接放行、`fw_mode` 为 `temp`（退出自动恢复）或 `persist`（常驻）。
+`auto_update` 关掉后只保留手动检查；`update_interval_h` 是自动检查间隔（小时）。
 
-另有一份 `%LOCALAPPDATA%\ClipShare\firewall.json`（Linux 同目录）记录"谁在什么时候开了哪条规则"，
-用于退出和闪退后精确回收，一般不用手动改。
+同目录下另有：
+
+- `instance.lock`：单实例锁，记录当前实例的 PID / 端口 / 令牌，退出自动清除
+- `firewall.json`：记录"谁在什么时候开了哪条规则"，用于退出和闪退后精确回收，一般不用手动改
+- `update/`：自动更新的下载与暂存目录，替换完成后可随时删除
 
 ---
 
@@ -269,6 +332,16 @@ Windows 11 默认折叠新图标，点任务栏 `^` 展开，或把它拖到常�
 **Q：放行端口会不会一直留在防火墙里？**
 默认不会。临时规则在退出、闪退、被强杀后都会撤销；下次启动还会再扫一遍残留。
 只有勾了「常驻」才会留下，需要手动点「恢复」删除。
+
+**Q：重复双击会不会起两个？**
+不会。第二次启动会检测到已有实例，直接把它的设置面板打开，不会占用端口也不会报 `WinError 10048`。
+
+**Q：不想让它自己更新？**
+面板「更新」卡片里取消勾选「自动检查并安装更新」，或命令行 `clipshare-cli.exe update --off`。
+关闭后仍然可以手动点「立即检查」和「升级到 vX」。
+
+**Q：只想单向同步（只发不收 / 只收不发）？**
+面板「已绑定对端」里勾选对端后点「禁止接收」或「禁止推送」即可，随时能「恢复收发」。
 
 **Q：放行时没弹 UAC / 点了否会怎样？**
 没弹窗说明当前已经是管理员；点了否则规则没建成，面板会继续提示“疑似被拦截”，再点一次即可。
