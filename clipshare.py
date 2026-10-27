@@ -54,7 +54,7 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.4"
+VERSION = "1.4.6"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -530,6 +530,8 @@ class Core:
         self.seen = collections.deque(maxlen=1024)
         self.last_seq = clipboard().seq()
         self.last_text = clipboard().read() or ""
+        # 上一次提示「剪贴板是非文本」时的序列号，避免同一张图刷屏
+        self.nontext_seq = 0
         self.latest = None
         self.push_count = 0
         self.recv_count = 0
@@ -569,7 +571,12 @@ class Core:
         return None
 
     def apply_remote(self, clip: dict, src: str = "") -> str:
+        # 注意：下面每个 return 都要留日志。这些分支以前全是静默 return，
+        # 面板上对端仍显示「推送成功」（HTTP 200），用户只看到「复制了没反应」，
+        # 翻日志一个字都没有 —— 和 v1.4.4 那个「ok 被当成成功」是同一类坑。
+        who = clip.get("from") or src or "?"
         if self.paused:
+            log.info("← 收到 %s 的内容，但本机已暂停同步，未写入剪贴板", who)
             return "paused"
         peer = self.peer_by_src(src)
         if peer is not None and not peer_flag(peer, "recv"):
@@ -577,16 +584,23 @@ class Core:
             return "blocked"
         text = clip.get("text")
         if not isinstance(text, str) or text == "":
+            log.info("← 收到 %s 的剪贴板，但内容为空，已忽略", who)
             return "empty"
-        if len(text.encode("utf-8")) > self.cfg["max_kb"] * 1024:
+        size = len(text.encode("utf-8"))
+        if size > self.cfg["max_kb"] * 1024:
+            log.warning("← 收到 %s 的剪贴板 %d 字节，超过上限 %d KB，已丢弃"
+                        "（调大上限：config --max-kb）", who, size, self.cfg["max_kb"])
             return "too_large"
         cid = clip.get("id") or ""
         with self.lock:
             if cid and cid in self.seen:
+                log.debug("← 收到 %s 的剪贴板，但该条已处理过（重试重复投递），跳过", who)
                 return "dup"
             if cid:
                 self.seen.append(cid)
             if text == self.last_text:
+                log.info("← 收到 %s 的剪贴板，但与本机剪贴板内容完全相同，无需写入（%d 字）",
+                         who, len(text))
                 return "same"
             self.suppress_until = time.time() + 0.6
             ok = clipboard().write(text)
@@ -666,6 +680,14 @@ class Pusher(threading.Thread):
                     }
                     log.info("推送到 %s 被拒：对方已禁止接收本机内容", key)
                     return
+                if exc.code == 409:
+                    # 对方处于暂停状态，内容被丢弃。重试也没用，直接说明原因，
+                    # 别让面板显示成「推送成功」。
+                    self.core.peer_state[key] = {
+                        "ok": False, "err": "对方已暂停同步", "ts": int(time.time()),
+                    }
+                    log.warning("推送到 %s 失败：对方处于「暂停同步」状态，内容已被丢弃", key)
+                    return
                 last_err = f"HTTP {exc.code}"
                 if exc.code in (401, 403):
                     break
@@ -700,7 +722,13 @@ def poller_loop(core: Core) -> None:
                 continue  # 自己刚写入的，不回推
             text = clip.read()
             if not text:
-                continue  # 图片 / 文件等非文本
+                # 图片 / 文件等非文本：本工具只同步纯文本，这里必须留一条日志，
+                # 否则用户复制一张图会表现为「完全没反应」，以为程序坏了。
+                # 同一次「非文本复制」只提示一次（seq 变了才算新的一次）。
+                if core.nontext_seq != seq:
+                    core.nontext_seq = seq
+                    log.info("剪贴板内容是图片/文件等非文本，暂不支持同步（当前只同步纯文本），已跳过")
+                continue
             if len(text.encode("utf-8")) > core.cfg["max_kb"] * 1024:
                 log.debug("内容超过 %d KB，跳过", core.cfg["max_kb"])
                 continue
@@ -934,8 +962,12 @@ class Handler(BaseHTTPRequestHandler):
             if res == "blocked":
                 return self._json(403, {"ok": False, "result": res,
                                         "error": "本机已把该对端设为禁止接收"})
-            code = 200 if res in ("ok", "same", "dup", "paused") else 400
-            return self._json(code, {"ok": res in ("ok", "same", "dup", "paused"), "result": res})
+            # 只有 ok / same / dup 算真正落到剪贴板（same/dup 说明内容本来就在）。
+            # paused 是「本机暂停、内容被丢掉」，绝不能回 ok=True，否则发送方
+            # 会显示推送成功，用户以为同步好了，实际什么都没发生。
+            accepted = res in ("ok", "same", "dup")
+            code = 200 if accepted else (409 if res == "paused" else 400)
+            return self._json(code, {"ok": accepted, "result": res})
 
         if path == "/api/broadcast":
             body = self._body()
@@ -3246,15 +3278,27 @@ def spawn_background() -> None:
     if os.name == "nt":
         DETACHED_PROCESS = 0x00000008
         CREATE_NO_WINDOW = 0x08000000
-        kwargs["creationflags"] = DETACHED_PROCESS | CREATE_NO_WINDOW
+        # CREATE_BREAKAWAY_FROM_JOB：父进程在 Job 里时，让子进程不属于那个 Job。
+        # 不加这个，终端/启动器退出会把后台服务一起带走（日志无退出记录、端口消失）。
+        CREATE_BREAKAWAY_FROM_JOB = 0x01000000
+        flags = DETACHED_PROCESS | CREATE_NO_WINDOW
         kwargs["stdin"] = subprocess.DEVNULL
         kwargs["stdout"] = subprocess.DEVNULL
         kwargs["stderr"] = subprocess.DEVNULL
-    else:
-        kwargs["stdin"] = subprocess.DEVNULL
-        kwargs["stdout"] = subprocess.DEVNULL
-        kwargs["stderr"] = subprocess.DEVNULL
-        kwargs["start_new_session"] = True
+        try:
+            proc = subprocess.Popen(base_argv() + ["gui", "--silent"],
+                                    creationflags=flags | CREATE_BREAKAWAY_FROM_JOB, **kwargs)
+        except OSError:
+            # 部分 Job（不允许 breakaway）会拒绝该标志，退一步仍按原方式启动：
+            # 至少服务能起来，只是可能随父进程一起被回收。
+            proc = subprocess.Popen(base_argv() + ["gui", "--silent"],
+                                    creationflags=flags, **kwargs)
+        log.debug("后台进程已拉起：pid=%s", proc.pid)
+        return
+    kwargs["stdin"] = subprocess.DEVNULL
+    kwargs["stdout"] = subprocess.DEVNULL
+    kwargs["stderr"] = subprocess.DEVNULL
+    kwargs["start_new_session"] = True
     subprocess.Popen(base_argv() + ["gui", "--silent"], **kwargs)
 
 
