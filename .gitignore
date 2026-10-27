@@ -16,3 +16,5 @@ dist-new/
 dist-fix/
 build-fix/
 .backup-*/
+build-new*/
+dist-new/
