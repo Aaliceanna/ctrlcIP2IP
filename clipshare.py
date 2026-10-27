@@ -54,7 +54,7 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.3"
+VERSION = "1.4.4"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -733,13 +733,18 @@ TRAY = None
 
 def _peer_rows() -> list[dict]:
     """对端列表（含收发策略），状态与批量操作共用。"""
+    # 只监听回环时，对端**不可能**连进来，mutual 无论配置里存的是什么都是假的。
+    # 旧版本会用 rev.ok 把它写成 True 并持久化下来，这里必须按当前监听地址纠偏，
+    # 否则面板会一直显示「双向」骗人。
+    inbound_ok = str(CORE.cfg.get("bind") or "") not in ("127.0.0.1", "::1", "localhost")
     return [
         {
             "key": peer_key(p),
             "name": p.get("name"),
             "host": p.get("host"),
             "port": p.get("port"),
-            "mutual": bool(p.get("mutual")),
+            "mutual": bool(p.get("mutual")) and inbound_ok,
+            "inbound_ok": inbound_ok,
             "push": peer_flag(p, "push"),
             "recv": peer_flag(p, "recv"),
             "state": CORE.peer_state.get(peer_key(p), {}),
@@ -974,19 +979,23 @@ class Handler(BaseHTTPRequestHandler):
             rev: dict = {"ok": False, "skipped": True, "error": ""}
             if reverse and ok:
                 rev = reverse_bind(CORE.cfg, peer)
-                if rev.get("ok"):
+                if rev_is_mutual(rev):
                     log.info("双向绑定成功：对方已把本机加入对端列表（%s）", rev.get("detail") or "ok")
+                elif rev.get("ok"):
+                    # 对方记下了本机，但它反向握手失败 → 说明本机这一侧连不进来
+                    log.warning("对方已把本机加入列表，但对方连不回本机：%s", rev.get("detail") or "")
+                    _log_inbound_hint(CORE.cfg)
                 elif not rev.get("skipped"):
                     log.warning("对方未能回绑本机：%s", rev.get("error"))
                 for p in CORE.cfg.get("peers") or []:
                     if peer_key(p) == peer_key(peer):
-                        p["mutual"] = bool(rev.get("ok"))
+                        p["mutual"] = rev_is_mutual(rev)
                         save_config(CORE.cfg)
                         break
 
             # 需要时给出防火墙体检结果，让面板可以提示一键放行
             fw = None
-            if CORE.cfg.get("fw_autocheck", True) and (not ok or not rev.get("ok")):
+            if CORE.cfg.get("fw_autocheck", True) and (not ok or not rev_is_mutual(rev)):
                 fw = fw_check()
                 if fw.get("state") == "blocked" and CORE.cfg.get("fw_autoopen", False):
                     opened = fw_open(int(CORE.cfg["port"]), CORE.cfg.get("fw_mode", "temp"))
@@ -998,9 +1007,14 @@ class Handler(BaseHTTPRequestHandler):
                             rev = reverse_bind(CORE.cfg, peer)
                             for p in CORE.cfg.get("peers") or []:
                                 if peer_key(p) == peer_key(peer):
-                                    p["mutual"] = bool(rev.get("ok"))
+                                    p["mutual"] = rev_is_mutual(rev)
                                     save_config(CORE.cfg)
                                     break
+                            if rev_is_mutual(rev):
+                                log.info("放行防火墙后重试：双向绑定成功")
+                            elif rev.get("ok"):
+                                log.warning("放行防火墙后对方仍连不回本机：%s", rev.get("detail") or "")
+                                _log_inbound_hint(CORE.cfg)
 
             return self._json(
                 200,
@@ -1010,7 +1024,7 @@ class Handler(BaseHTTPRequestHandler):
                     "updated": updated,
                     "error": "" if ok else detail,
                     "reverse": rev,
-                    "mutual": bool(rev.get("ok")),
+                    "mutual": rev_is_mutual(rev),
                     "firewall": fw,
                 },
             )
@@ -1069,6 +1083,14 @@ class Handler(BaseHTTPRequestHandler):
             updated = upsert_peer(CORE.cfg, peer)
             CORE.reload()
             ok, detail = handshake(peer, timeout=3.0)
+            # 这里是我们主动去握手对方，通了才说明这条链路真的可用；
+            # 握手不通就别再把 mutual 标成 True，否则面板会显示「双向」骗人。
+            peer["mutual"] = bool(ok)
+            for p in CORE.cfg.get("peers") or []:
+                if peer_key(p) == peer_key(peer):
+                    p["mutual"] = bool(ok)
+                    save_config(CORE.cfg)
+                    break
             log.info("对端 %s 回绑本机（%s:%s）→ %s", name, host, port, "握手成功" if ok else detail)
             return self._json(
                 200,
@@ -2946,6 +2968,57 @@ def reverse_bind(cfg: dict, peer: dict, timeout: float = 4.0) -> dict:
         return {"ok": False, "error": f"{type(exc).__name__}：连不上对方（IP/端口/防火墙/对方是否在线）"}
 
 
+def _log_inbound_hint(cfg: dict) -> None:
+    """对方连不回本机时，把「为什么」直接写进日志，别让用户自己猜。
+
+    最常见的两个原因：只监听回环（对方包根本送不到本机网卡），
+    或防火墙没放行入站端口。
+    """
+    try:
+        b = str(cfg.get("bind") or "").strip()
+        port = int(cfg.get("port") or 0)
+        if b in ("127.0.0.1", "::1", "localhost"):
+            adv = advertise_host(cfg)
+            log.warning("  原因：本机监听 %s:%s 只对回环开放，对方连不进来 —— "
+                        "执行 `clipshare-cli.exe config --bind 0.0.0.0` 后 restart 即可（本机内网地址 %s）",
+                        b, port, adv)
+            return
+        chk = fw_check()
+        if chk.get("state") == "blocked" or not chk.get("port_allowed"):
+            log.warning("  原因：防火墙似乎没放行入站 TCP %s —— 面板点「一键放行」，"
+                        "或执行 `clipshare-cli.exe fw --open --port %s`", port, port)
+            return
+        log.warning("  原因：入站 TCP %s 已放行，但对方仍连不回 —— 检查两台机器是否在同一网段/"
+                    "中间有无 NAT 或代理接管（本机通告地址 %s:%s）", port, advertise_host(cfg), port)
+    except Exception:
+        pass
+
+
+def rev_is_mutual(rev: dict) -> bool:
+    """回绑结果是否真的构成「双向」。
+
+    `ok` 只说明**对方收下了本机的信息并写进了它的对端列表**，不代表对方
+    真能连回本机 —— 对方随后会立刻用这个地址反向握手一次，结果放在
+    `handshake` 里。本机只监听 127.0.0.1、或防火墙挡住入站时，`ok` 依然是
+    True 而 `handshake` 是 False，只看 `ok` 就会报出「双向绑定成功」却根本
+    收不到任何东西。所以必须两个都为真才算双向。
+    """
+    return bool(rev.get("ok")) and bool(rev.get("handshake"))
+
+
+def reverse_bind_note(rev: dict) -> str:
+    """把回绑结果翻译成一句人话，避免把超时原因当成成功附注打出来。"""
+    if rev.get("skipped"):
+        return "对方跳过了回绑（可能它认为对端就是自己）"
+    if rev_is_mutual(rev):
+        return "双向绑定成功：对方已把本机加入对端列表，且已握手成功"
+    if rev.get("ok"):
+        why = str(rev.get("detail") or "").strip() or "对方连不回本机"
+        return f"对方已把本机加入列表，但对方连不回本机 —— 只能本机推给它，不能它推给本机（{why}）"
+    err = str(rev.get("error") or "").strip()
+    return f"单向绑定成功，但对方未能回绑本机：{err or '未知原因'}"
+
+
 def reverse_unbind(cfg: dict, peer: dict, timeout: float = 3.0) -> dict:
     """解绑时通知对方把我删掉，避免单向残留。"""
     try:
@@ -3748,15 +3821,12 @@ def cmd_bind(args, cfg: dict) -> int:
         rev = reverse_bind(cfg, peer)
         for p in cfg.get("peers") or []:
             if peer_key(p) == peer_key(peer):
-                p["mutual"] = bool(rev.get("ok"))
+                p["mutual"] = rev_is_mutual(rev)
                 save_config(cfg)
                 break
-        if rev.get("ok"):
-            print("双向绑定成功：对方已把本机加入对端列表，两边都能互相推送")
-        elif rev.get("skipped"):
-            print("对方跳过了回绑（可能它认为对端就是自己）")
-        else:
-            print(f"单向绑定成功，但对方未能回绑本机：{rev.get('error')}")
+        print(reverse_bind_note(rev))
+        if rev.get("ok") and not rev_is_mutual(rev):
+            _log_inbound_hint(cfg)
 
     if service_alive(cfg):
         hot = notify_reload(cfg)

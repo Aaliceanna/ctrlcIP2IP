@@ -411,8 +411,10 @@ function renderPeers(peers){
     const cls = p.state ? (ok?'ok':'bad') : 'unk';
     const txt = p.state ? (ok?'正常':(p.state.err||'失败')) : '未探测';
     const mutual = p.mutual
-      ? '<span class="mutual" title="对方也绑定了本机">双向</span>'
-      : '<span class="mutual off" title="只有本机单向绑定，建议重新绑定一次">单向</span>';
+      ? '<span class="mutual" title="对方也绑定了本机，两边都能互相推送">双向</span>'
+      : (p.inbound_ok === false
+          ? '<span class="mutual off" title="本机只监听 127.0.0.1，对方连不进来；改成 0.0.0.0 后重新绑定">单向·监听仅本机</span>'
+          : '<span class="mutual off" title="对方记住了本机，但它连不回本机（监听地址/防火墙/网段不通），只能本机推给它">单向</span>');
     const push = p.push === false
       ? '<span class="flag off">禁推送</span>' : '<span class="flag on">可推送</span>';
     const recv = p.recv === false
