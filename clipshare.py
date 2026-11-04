@@ -24,6 +24,10 @@ from __future__ import annotations
 
 import argparse
 import atexit
+import base64
+import io
+import struct
+import zlib
 import collections
 import ctypes
 import hmac
@@ -54,7 +58,7 @@ import webbrowser
 import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "1.4.6"
+VERSION = "1.5.0"
 APP_NAME = "ClipShare"
 IS_WIN = sys.platform.startswith("win")
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -94,6 +98,541 @@ CONFIG_PATH = os.path.join(HOME, "config.json")
 LOG_PATH = os.path.join(HOME, "clipshare.log")
 LOCK_PATH = os.path.join(HOME, "instance.lock")     # 单实例锁（含占用者 PID）
 UPDATE_DIR = os.path.join(HOME, "update")           # 自动更新的下载/暂存目录
+RECV_DIR = os.path.join(HOME, "received")           # 默认接收文件/图片落盘目录
+
+
+def recv_dir(cfg: dict | None = None) -> str:
+    custom = str((cfg or {}).get("recv_dir") or "").strip()
+    d = os.path.abspath(os.path.expanduser(custom)) if custom else RECV_DIR
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def fmt_size(n: int) -> str:
+    n = max(0, int(n or 0))
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n / 1024:.1f} KB"
+    return f"{n / (1024 * 1024):.2f} MB"
+
+
+# --------------------------------------------------------------------------
+# 图片与文件编解码辅助（支持 PIL 加速 + 纯标准库回退）
+# --------------------------------------------------------------------------
+PNG_MAGIC = b"\x89PNG\r\n\x1a\n"
+
+
+def _trim_png(data: bytes) -> bytes:
+    """截掉 Windows GlobalSize 可能附带的尾部零填充，精确到 IEND 块末尾。"""
+    if not data.startswith(PNG_MAGIC):
+        return data
+    pos = 8
+    n = len(data)
+    while pos + 12 <= n:
+        length = struct.unpack_from(">I", data, pos)[0]
+        ctype = data[pos + 4 : pos + 8]
+        pos += 12 + length
+        if ctype == b"IEND":
+            return data[: min(pos, n)]
+    return data
+
+
+def _png_chunk(ctype: bytes, body: bytes) -> bytes:
+    crc = zlib.crc32(ctype + body) & 0xFFFFFFFF
+    return struct.pack(">I", len(body)) + ctype + body + struct.pack(">I", crc)
+
+
+def _encode_png_rgba(width: int, height: int, raw: bytes, channels: int = 4) -> bytes:
+    """纯标准库 PNG 编码（8-bit RGB 或 RGBA）。"""
+    color_type = 6 if channels == 4 else 2
+    ihdr = struct.pack(">IIBBBBB", width, height, 8, color_type, 0, 0, 0)
+    stride = width * channels
+    rows = [b"\x00" + raw[y * stride : (y + 1) * stride] for y in range(height)]
+    idat = zlib.compress(b"".join(rows), 6)
+    return PNG_MAGIC + _png_chunk(b"IHDR", ihdr) + _png_chunk(b"IDAT", idat) + _png_chunk(b"IEND", b"")
+
+
+def _paeth(a: int, b: int, c: int) -> int:
+    p = a + b - c
+    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+    if pa <= pb and pa <= pc:
+        return a
+    return b if pb <= pc else c
+
+
+def _decode_png_rgba(data: bytes) -> tuple[int, int, bytes] | None:
+    """把图片字节（PNG/BMP/JPG 等）解码为 (width, height, top-down RGBA bytes)。"""
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(data)) as im:
+            rgba = im.convert("RGBA")
+            return rgba.width, rgba.height, rgba.tobytes()
+    except Exception:
+        pass
+    if not data.startswith(PNG_MAGIC) or len(data) < 33:
+        return None
+    try:
+        pos = 8
+        w = h = bit_depth = color_type = 0
+        idat_parts: list[bytes] = []
+        while pos + 12 <= len(data):
+            length = struct.unpack_from(">I", data, pos)[0]
+            ctype = data[pos + 4 : pos + 8]
+            chunk = data[pos + 8 : pos + 8 + length]
+            pos += 12 + length
+            if ctype == b"IHDR" and len(chunk) >= 13:
+                w, h, bit_depth, color_type = struct.unpack_from(">IIBB", chunk, 0)
+            elif ctype == b"IDAT":
+                idat_parts.append(chunk)
+            elif ctype == b"IEND":
+                break
+        if w <= 0 or h <= 0 or bit_depth != 8 or color_type not in (2, 6):
+            return None
+        bpp = 4 if color_type == 6 else 3
+        stride = w * bpp
+        raw = zlib.decompress(b"".join(idat_parts))
+        if len(raw) < h * (1 + stride):
+            return None
+        out = bytearray(w * h * 4)
+        prev = bytearray(stride)
+        cur = bytearray(stride)
+        for y in range(h):
+            base = y * (1 + stride)
+            flt = raw[base]
+            line = raw[base + 1 : base + 1 + stride]
+            if flt == 0:
+                cur[:] = line
+            elif flt == 1:
+                for i in range(stride):
+                    cur[i] = (line[i] + (cur[i - bpp] if i >= bpp else 0)) & 0xFF
+            elif flt == 2:
+                for i in range(stride):
+                    cur[i] = (line[i] + prev[i]) & 0xFF
+            elif flt == 3:
+                for i in range(stride):
+                    a = cur[i - bpp] if i >= bpp else 0
+                    cur[i] = (line[i] + ((a + prev[i]) >> 1)) & 0xFF
+            elif flt == 4:
+                for i in range(stride):
+                    a = cur[i - bpp] if i >= bpp else 0
+                    b = prev[i]
+                    c = prev[i - bpp] if i >= bpp else 0
+                    cur[i] = (line[i] + _paeth(a, b, c)) & 0xFF
+            else:
+                return None
+            prev[:] = cur
+            dst_off = y * w * 4
+            if bpp == 4:
+                out[dst_off : dst_off + w * 4] = cur
+            else:
+                for x in range(w):
+                    out[dst_off + x * 4 : dst_off + x * 4 + 3] = cur[x * 3 : x * 3 + 3]
+                    out[dst_off + x * 4 + 3] = 255
+        return w, h, bytes(out)
+    except Exception:
+        return None
+
+
+def dib_to_png(dib: bytes) -> bytes | None:
+    """把 Windows 剪贴板 CF_DIB 内存块转换为标准 PNG 字节。"""
+    if not dib or len(dib) < 40:
+        return None
+    bi_size, w, h_signed, _planes, bpp, comp, _img_sz, _xp, _yp, clr_used, _ci = (
+        struct.unpack_from("<IiiHHIIIIII", dib, 0)
+    )
+    if w <= 0 or h_signed == 0 or bi_size < 40:
+        return None
+    h = abs(h_signed)
+    top_down = h_signed < 0
+    offset = bi_size
+    if bi_size == 40 and comp == 3:  # BI_BITFIELDS 掩码（3 或 4 个 DWORD）
+        row_stride = ((w * bpp + 31) // 32) * 4
+        expect = row_stride * h
+        if len(dib) - (offset + 16) == expect:
+            offset += 16
+        else:
+            offset += 12
+    elif clr_used > 0:
+        offset += clr_used * 4
+    elif bpp <= 8:
+        offset += (1 << bpp) * 4
+
+    if bpp in (24, 32) and comp in (0, 3) and offset < len(dib):
+        row_stride = ((w * bpp + 31) // 32) * 4
+        pix = dib[offset:]
+        if len(pix) >= row_stride * h:
+            try:
+                from PIL import Image
+
+                if bpp == 32:
+                    im = Image.frombuffer(
+                        "RGBA", (w, h), pix[: row_stride * h], "raw",
+                        "BGRA", row_stride, 1 if top_down else -1,
+                    ).copy()
+                    # GDI 32 位位图常把第 4 字节（rgbReserved）全填 0，必须还原为不透明
+                    if im.getchannel("A").getextrema() == (0, 0):
+                        im.putalpha(255)
+                else:
+                    im = Image.frombuffer(
+                        "RGB", (w, h), pix[: row_stride * h], "raw",
+                        "BGR", row_stride, 1 if top_down else -1,
+                    ).copy()
+                buf = io.BytesIO()
+                im.save(buf, format="PNG")
+                return buf.getvalue()
+            except Exception:
+                pass
+            if bpp == 32:
+                all_zero_a = all(b == 0 for b in pix[3 : row_stride * h : 4])
+                rgba = bytearray(w * h * 4)
+                for y in range(h):
+                    src_y = y if top_down else (h - 1 - y)
+                    row = pix[src_y * row_stride : src_y * row_stride + w * 4]
+                    dst = y * w * 4
+                    rgba[dst + 0 : dst + w * 4 : 4] = row[2::4]
+                    rgba[dst + 1 : dst + w * 4 : 4] = row[1::4]
+                    rgba[dst + 2 : dst + w * 4 : 4] = row[0::4]
+                    rgba[dst + 3 : dst + w * 4 : 4] = (b"\xff" * w) if all_zero_a else row[3::4]
+                return _encode_png_rgba(w, h, bytes(rgba), 4)
+            rgb = bytearray(w * h * 3)
+            for y in range(h):
+                src_y = y if top_down else (h - 1 - y)
+                row = pix[src_y * row_stride : src_y * row_stride + w * 3]
+                dst = y * w * 3
+                rgb[dst + 0 : dst + w * 3 : 3] = row[2::3]
+                rgb[dst + 1 : dst + w * 3 : 3] = row[1::3]
+                rgb[dst + 2 : dst + w * 3 : 3] = row[0::3]
+            return _encode_png_rgba(w, h, bytes(rgb), 3)
+
+    try:
+        from PIL import Image
+
+        bmp = b"BM" + struct.pack("<III", 14 + len(dib), 0, 14 + min(offset, len(dib))) + dib
+        with Image.open(io.BytesIO(bmp)) as im:
+            buf = io.BytesIO()
+            im.convert("RGBA").save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        return None
+
+
+def png_to_dib(img_bytes: bytes) -> bytes | None:
+    """把 PNG（或任意图片字节）转换为 Windows CF_DIB（自下而上 32-bit BGRA）。"""
+    dec = _decode_png_rgba(img_bytes)
+    if not dec:
+        return None
+    w, h, rgba = dec
+    try:
+        from PIL import Image
+
+        im = Image.frombytes("RGBA", (w, h), rgba)
+        flip_op = getattr(getattr(Image, "Transpose", Image), "FLIP_TOP_BOTTOM")
+        im = im.transpose(flip_op)
+        r, g, b, a = im.split()
+        bgra = Image.merge("RGBA", (b, g, r, a)).tobytes()
+    except Exception:
+        bgra_buf = bytearray(w * h * 4)
+        stride = w * 4
+        for y in range(h):
+            row = rgba[(h - 1 - y) * stride : (h - y) * stride]
+            dst = y * stride
+            bgra_buf[dst + 0 : dst + stride : 4] = row[2::4]
+            bgra_buf[dst + 1 : dst + stride : 4] = row[1::4]
+            bgra_buf[dst + 2 : dst + stride : 4] = row[0::4]
+            bgra_buf[dst + 3 : dst + stride : 4] = row[3::4]
+        bgra = bytes(bgra_buf)
+    hdr = struct.pack("<IiiHHIIIIII", 40, w, h, 1, 32, 0, len(bgra), 3780, 3780, 0, 0)
+    return hdr + bgra
+
+
+def image_to_png(raw: bytes) -> bytes | None:
+    """把输入图片字节（PNG / BMP / DIB / JPEG / WebP 等）标准化为 PNG 字节。"""
+    if not raw:
+        return None
+    if raw.startswith(PNG_MAGIC):
+        return _trim_png(raw)
+    if raw.startswith(b"BM") and len(raw) > 54:
+        res = dib_to_png(raw[14:])
+        if res:
+            return res
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(raw)) as im:
+            buf = io.BytesIO()
+            im.convert("RGBA").save(buf, format="PNG")
+            return buf.getvalue()
+    except Exception:
+        pass
+    return dib_to_png(raw)
+
+
+def image_info(png_bytes: bytes) -> tuple[int, int, str]:
+    """返回 (width, height, 像素级内容哈希)。"""
+    dec = _decode_png_rgba(png_bytes)
+    if dec:
+        w, h, rgba = dec
+        rgb_only = bytearray(w * h * 3)
+        rgb_only[0::3] = rgba[0::4]
+        rgb_only[1::3] = rgba[1::4]
+        rgb_only[2::3] = rgba[2::4]
+        sig = hashlib.sha256(f"{w}x{h}:".encode() + bytes(rgb_only)).hexdigest()
+        return w, h, sig
+    w = h = 0
+    if png_bytes.startswith(PNG_MAGIC) and len(png_bytes) >= 24:
+        w, h = struct.unpack_from(">II", png_bytes, 16)
+    return w, h, hashlib.sha256(png_bytes).hexdigest()
+
+
+# --------------------------------------------------------------------------
+# 文件与文件夹打包 / 解包辅助
+# --------------------------------------------------------------------------
+_BAD_PATH_CHARS = set('<>:"|?*\x00')
+
+
+def _safe_rel_path(rel: str) -> str:
+    """清洗相对路径，严防 ../ 目录穿越与绝对路径。"""
+    norm = str(rel or "").replace("\\", "/").strip("/")
+    parts = []
+    for p in norm.split("/"):
+        p = p.strip()
+        if not p or p == ".":
+            continue
+        if p == ".." or ":" in p or any(c in _BAD_PATH_CHARS for c in p):
+            return ""
+        parts.append(p)
+    return "/".join(parts)
+
+
+def files_path_sig(paths: list[str]) -> str:
+    """根据本地文件路径、大小与修改时间生成快速签名，用于防回环与去重。"""
+    pieces = []
+    for p in sorted(os.path.abspath(x) for x in (paths or []) if x):
+        try:
+            st = os.stat(p)
+            pieces.append(f"{os.path.normcase(p)}|{st.st_size}|{int(st.st_mtime)}")
+        except OSError:
+            pieces.append(os.path.normcase(p))
+    return hashlib.sha256("\n".join(pieces).encode("utf-8")).hexdigest()
+
+
+def pack_files_payload(
+    paths: list[str], from_name: str, max_bytes: int, max_files: int = 500
+) -> tuple[dict | None, str]:
+    """把选中的文件/文件夹打包成可通过 JSON 发送的载荷。返回 (payload, error_msg)。"""
+    valid = []
+    seen_roots: set[str] = set()
+    for raw_p in paths or []:
+        if not raw_p:
+            continue
+        ap = os.path.abspath(raw_p)
+        if not os.path.exists(ap):
+            continue
+        base = os.path.basename(os.path.normpath(ap))
+        if not base or base in seen_roots:
+            continue
+        seen_roots.add(base)
+        valid.append((base, ap))
+    if not valid:
+        return None, "未找到有效文件"
+
+    entries: list[tuple[str, str, bool, int, int]] = []
+    total_size = 0
+    file_count = 0
+    roots: list[str] = []
+    for base, ap in valid:
+        safe_root = _safe_rel_path(base)
+        if not safe_root:
+            continue
+        roots.append(safe_root)
+        if os.path.isfile(ap) and not os.path.islink(ap):
+            try:
+                st = os.stat(ap)
+            except OSError:
+                continue
+            file_count += 1
+            total_size += st.st_size
+            if file_count > max_files:
+                return None, f"文件数量超过上限 {max_files} 个，已跳过"
+            if total_size > max_bytes:
+                return None, (
+                    f"文件总大小 {fmt_size(total_size)} 超过上限 {max_bytes // (1024 * 1024)} MB，"
+                    "已跳过（调大上限：config --max-file-mb）"
+                )
+            entries.append((safe_root, ap, False, st.st_size, int(st.st_mtime)))
+        elif os.path.isdir(ap) and not os.path.islink(ap):
+            entries.append((safe_root, ap, True, 0, int(os.path.getmtime(ap))))
+            for rdir, dirs, fnames in os.walk(ap):
+                rel_dir = os.path.relpath(rdir, ap).replace("\\", "/")
+                prefix = safe_root if rel_dir == "." else f"{safe_root}/{rel_dir}"
+                for d in sorted(dirs):
+                    full_d = os.path.join(rdir, d)
+                    if os.path.islink(full_d):
+                        continue
+                    srel = _safe_rel_path(f"{prefix}/{d}")
+                    if srel:
+                        entries.append((srel, full_d, True, 0, 0))
+                for fn in sorted(fnames):
+                    full_f = os.path.join(rdir, fn)
+                    if os.path.islink(full_f) or not os.path.isfile(full_f):
+                        continue
+                    try:
+                        st = os.stat(full_f)
+                    except OSError:
+                        continue
+                    file_count += 1
+                    total_size += st.st_size
+                    if file_count > max_files:
+                        return None, f"文件夹内文件数量超过上限 {max_files} 个，已跳过"
+                    if total_size > max_bytes:
+                        return None, (
+                            f"文件总大小 {fmt_size(total_size)} 超过上限 {max_bytes // (1024 * 1024)} MB，"
+                            "已跳过（调大上限：config --max-file-mb）"
+                        )
+                    srel = _safe_rel_path(f"{prefix}/{fn}")
+                    if srel:
+                        entries.append((srel, full_f, False, st.st_size, int(st.st_mtime)))
+
+    if not entries:
+        return None, "没有可同步的文件内容"
+
+    items: list[dict] = []
+    manifest = hashlib.sha256()
+    for rel, ap, is_dir, sz, mtime in entries:
+        if is_dir:
+            items.append({"rel": rel, "is_dir": True})
+            manifest.update(f"D:{rel}\n".encode("utf-8"))
+            continue
+        try:
+            with open(ap, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            return None, f"读取文件失败（{os.path.basename(ap)}）：{exc}"
+        f_sha = hashlib.sha256(data).hexdigest()
+        manifest.update(f"F:{rel}:{len(data)}:{f_sha}\n".encode("utf-8"))
+        items.append(
+            {
+                "rel": rel,
+                "is_dir": False,
+                "size": len(data),
+                "mtime": mtime,
+                "sha256": f_sha,
+                "data_b64": base64.b64encode(data).decode("ascii"),
+            }
+        )
+
+    return (
+        {
+            "id": uuid.uuid4().hex,
+            "kind": "files",
+            "roots": roots,
+            "files": items,
+            "total_size": total_size,
+            "file_count": file_count,
+            "sha256": manifest.hexdigest(),
+            "ts": now_ms(),
+            "from": from_name,
+        },
+        "",
+    )
+
+
+def _try_materialize_files(
+    items: list[dict], roots: list[str], dest_dir: str, max_bytes: int
+) -> tuple[list[str], int]:
+    """在 dest_dir 下解包所有目录和文件，返回 (顶层绝对路径列表, 总字节数)。"""
+    os.makedirs(dest_dir, exist_ok=True)
+    for r in roots:
+        sr = _safe_rel_path(r)
+        if not sr:
+            continue
+        p = os.path.join(dest_dir, sr.replace("/", os.sep))
+        if os.path.isdir(p) and not os.path.islink(p):
+            shutil.rmtree(p)
+
+    total_written = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        rel = _safe_rel_path(item.get("rel") or item.get("name") or "")
+        if not rel:
+            raise ValueError("非法文件路径")
+        full = os.path.abspath(os.path.join(dest_dir, rel.replace("/", os.sep)))
+        if os.path.commonpath([os.path.abspath(dest_dir), full]) != os.path.abspath(dest_dir):
+            raise ValueError("路径越界")
+        if item.get("is_dir"):
+            os.makedirs(full, exist_ok=True)
+            continue
+        raw = base64.b64decode(item.get("data_b64") or "")
+        total_written += len(raw)
+        if total_written > max_bytes:
+            raise ValueError("文件总大小超过上限")
+        os.makedirs(os.path.dirname(full), exist_ok=True)
+        tmp = full + f".part.{os.getpid()}"
+        try:
+            with open(tmp, "wb") as f:
+                f.write(raw)
+            os.replace(tmp, full)
+            mtime = int(item.get("mtime") or 0)
+            if mtime > 0:
+                try:
+                    os.utime(full, (mtime, mtime))
+                except OSError:
+                    pass
+        finally:
+            if os.path.exists(tmp):
+                try:
+                    os.remove(tmp)
+                except OSError:
+                    pass
+
+    out_paths = []
+    for r in roots:
+        sr = _safe_rel_path(r)
+        if sr:
+            p = os.path.abspath(os.path.join(dest_dir, sr.replace("/", os.sep)))
+            if os.path.exists(p):
+                out_paths.append(p)
+    return out_paths, total_written
+
+
+def unpack_files_payload(
+    clip: dict, target_root: str, max_bytes: int
+) -> tuple[list[str], int, str]:
+    """将对端发来的 files 载荷落盘到接收目录，返回 (本地绝对路径列表, 总字节数, 错误信息)。"""
+    items = clip.get("files")
+    if not isinstance(items, list) or not items:
+        return [], 0, "文件列表为空"
+    roots = clip.get("roots")
+    if not isinstance(roots, list) or not roots:
+        roots = []
+        for it in items:
+            if isinstance(it, dict):
+                r = _safe_rel_path(it.get("rel") or it.get("name") or "").split("/")[0]
+                if r and r not in roots:
+                    roots.append(r)
+    if not roots:
+        return [], 0, "无有效顶层文件"
+
+    try:
+        paths, total = _try_materialize_files(items, roots, target_root, max_bytes)
+        if paths:
+            return paths, total, ""
+    except PermissionError:
+        pass
+    except ValueError as exc:
+        return [], 0, str(exc)
+    except Exception:
+        pass
+
+    batch_dir = os.path.join(target_root, f"batch_{int(time.time())}_{uuid.uuid4().hex[:6]}")
+    try:
+        paths, total = _try_materialize_files(items, roots, batch_dir, max_bytes)
+        return paths, total, "" if paths else "未生成有效文件"
+    except Exception as exc:
+        return [], 0, str(exc)
 
 log = logging.getLogger("clipshare")
 
@@ -117,6 +656,9 @@ def setup_logging(silent: bool) -> None:
 # Windows 剪贴板（ctypes 直调，零依赖）
 # --------------------------------------------------------------------------
 class WinClipboard:
+    CF_BITMAP = 2
+    CF_DIB = 8
+    CF_HDROP = 15
     CF_UNICODETEXT = 13
     GMEM_MOVEABLE = 0x0002
 
@@ -140,6 +682,20 @@ class WinClipboard:
         self.k.GlobalUnlock.restype = ctypes.c_bool
         self.k.GlobalFree.argtypes = [ctypes.c_void_p]
         self.k.GlobalFree.restype = ctypes.c_void_p
+        self.sh = ctypes.WinDLL("shell32", use_last_error=True)
+        self.u.IsClipboardFormatAvailable.argtypes = [ctypes.c_uint]
+        self.u.IsClipboardFormatAvailable.restype = ctypes.c_bool
+        self.u.RegisterClipboardFormatW.argtypes = [ctypes.c_wchar_p]
+        self.u.RegisterClipboardFormatW.restype = ctypes.c_uint
+        self.k.GlobalSize.argtypes = [ctypes.c_void_p]
+        self.k.GlobalSize.restype = ctypes.c_size_t
+        self.sh.DragQueryFileW.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_uint
+        ]
+        self.sh.DragQueryFileW.restype = ctypes.c_uint
+        self.CF_PNG = int(self.u.RegisterClipboardFormatW("PNG") or 0)
+        self.CF_IMAGE_PNG = int(self.u.RegisterClipboardFormatW("image/png") or 0)
+        self.CF_DROPEFFECT = int(self.u.RegisterClipboardFormatW("Preferred DropEffect") or 0)
 
     def seq(self) -> int:
         try:
@@ -194,6 +750,188 @@ class WinClipboard:
         finally:
             self.u.CloseClipboard()
         return ok
+
+
+    def _get_bytes_unlocked(self, fmt: int) -> bytes | None:
+        if not fmt or not self.u.IsClipboardFormatAvailable(fmt):
+            return None
+        h = self.u.GetClipboardData(fmt)
+        if not h:
+            return None
+        size = int(self.k.GlobalSize(h) or 0)
+        if size <= 0:
+            return None
+        p = self.k.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return ctypes.string_at(p, size)
+        finally:
+            self.k.GlobalUnlock(h)
+
+    def _set_bytes_unlocked(self, fmt: int, data: bytes) -> bool:
+        if not fmt or not data:
+            return False
+        h = self.k.GlobalAlloc(self.GMEM_MOVEABLE, len(data))
+        if not h:
+            return False
+        p = self.k.GlobalLock(h)
+        if not p:
+            self.k.GlobalFree(h)
+            return False
+        ctypes.memmove(p, data, len(data))
+        self.k.GlobalUnlock(h)
+        if self.u.SetClipboardData(fmt, h):
+            return True
+        self.k.GlobalFree(h)
+        return False
+
+    def _read_text_unlocked(self) -> str | None:
+        if not self.u.IsClipboardFormatAvailable(self.CF_UNICODETEXT):
+            return None
+        h = self.u.GetClipboardData(self.CF_UNICODETEXT)
+        if not h:
+            return None
+        p = self.k.GlobalLock(h)
+        if not p:
+            return None
+        try:
+            return ctypes.wstring_at(p)
+        finally:
+            self.k.GlobalUnlock(h)
+
+    def _read_files_unlocked(self) -> list[str]:
+        if not self.u.IsClipboardFormatAvailable(self.CF_HDROP):
+            return []
+        h = self.u.GetClipboardData(self.CF_HDROP)
+        if not h:
+            return []
+        out: list[str] = []
+        try:
+            count = int(self.sh.DragQueryFileW(h, 0xFFFFFFFF, None, 0) or 0)
+            for i in range(count):
+                n = int(self.sh.DragQueryFileW(h, i, None, 0) or 0)
+                if n <= 0:
+                    continue
+                buf = ctypes.create_unicode_buffer(n + 2)
+                if self.sh.DragQueryFileW(h, i, buf, n + 1):
+                    p = buf.value.strip()
+                    if p and os.path.exists(p):
+                        out.append(os.path.abspath(p))
+        except Exception:
+            pass
+        if out:
+            return out
+        raw = self._get_bytes_unlocked(self.CF_HDROP)
+        if not raw or len(raw) <= 20:
+            return []
+        p_files, _x, _y, _fnc, f_wide = struct.unpack_from("<IiiII", raw, 0)
+        if p_files < 20 or p_files >= len(raw):
+            return []
+        body = raw[p_files:]
+        if f_wide:
+            text = body.decode("utf-16-le", errors="ignore")
+        else:
+            text = body.decode(locale.getpreferredencoding(False) or "mbcs", errors="ignore")
+        for part in text.split("\x00"):
+            if not part:
+                break
+            if os.path.exists(part):
+                out.append(os.path.abspath(part))
+        return out
+
+    def _read_image_unlocked(self) -> bytes | None:
+        for fmt in (self.CF_PNG, self.CF_IMAGE_PNG):
+            raw = self._get_bytes_unlocked(fmt)
+            if raw and raw.startswith(PNG_MAGIC):
+                return _trim_png(raw)
+        dib = self._get_bytes_unlocked(self.CF_DIB)
+        if dib:
+            return dib_to_png(dib)
+        return None
+
+    def read_files(self) -> list[str]:
+        if not self._open():
+            return []
+        try:
+            return self._read_files_unlocked()
+        finally:
+            self.u.CloseClipboard()
+
+    def read_image(self) -> bytes | None:
+        if not self._open():
+            return None
+        try:
+            return self._read_image_unlocked()
+        finally:
+            self.u.CloseClipboard()
+
+    def read_item(self) -> dict | None:
+        if not self._open():
+            return None
+        try:
+            has_hdrop = bool(self.u.IsClipboardFormatAvailable(self.CF_HDROP))
+            has_text = bool(self.u.IsClipboardFormatAvailable(self.CF_UNICODETEXT))
+            has_img = bool(
+                self.u.IsClipboardFormatAvailable(self.CF_DIB)
+                or (self.CF_PNG and self.u.IsClipboardFormatAvailable(self.CF_PNG))
+                or (self.CF_IMAGE_PNG and self.u.IsClipboardFormatAvailable(self.CF_IMAGE_PNG))
+            )
+            if has_hdrop and not has_img:
+                files = self._read_files_unlocked()
+                if files:
+                    return {"kind": "files", "paths": files}
+            if has_text:
+                text = self._read_text_unlocked()
+                if text:
+                    return {"kind": "text", "text": text}
+            if has_img:
+                img = self._read_image_unlocked()
+                if img:
+                    return {"kind": "image", "data": img}
+            if has_hdrop:
+                files = self._read_files_unlocked()
+                if files:
+                    return {"kind": "files", "paths": files}
+            return None
+        finally:
+            self.u.CloseClipboard()
+
+    def write_image(self, img_bytes: bytes) -> bool:
+        png = image_to_png(img_bytes)
+        if not png:
+            return False
+        dib = png_to_dib(png)
+        if not dib:
+            return False
+        if not self._open():
+            return False
+        try:
+            self.u.EmptyClipboard()
+            ok_dib = self._set_bytes_unlocked(self.CF_DIB, dib)
+            if self.CF_PNG:
+                self._set_bytes_unlocked(self.CF_PNG, png)
+            return ok_dib
+        finally:
+            self.u.CloseClipboard()
+
+    def write_files(self, paths: list[str]) -> bool:
+        norm = [os.path.abspath(p) for p in (paths or []) if p and os.path.exists(p)]
+        if not norm:
+            return False
+        header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+        body = ("\x00".join(norm) + "\x00\x00").encode("utf-16-le")
+        drop_data = header + body
+        if not self._open():
+            return False
+        try:
+            self.u.EmptyClipboard()
+            ok = self._set_bytes_unlocked(self.CF_HDROP, drop_data)
+            if ok and self.CF_DROPEFFECT:
+                self._set_bytes_unlocked(self.CF_DROPEFFECT, struct.pack("<I", 1))
+            return ok
+        finally:
+            self.u.CloseClipboard()
 
 
 class PosixClipboard:
@@ -276,6 +1014,134 @@ class PosixClipboard:
             return False
 
 
+    def _targets(self) -> list[str]:
+        try:
+            if self.tool == "wl-clipboard":
+                r = subprocess.run(["wl-paste", "--list-types"], capture_output=True, timeout=2)
+            elif self.tool == "xclip":
+                r = subprocess.run(
+                    ["xclip", "-selection", "clipboard", "-t", "TARGETS", "-o"],
+                    capture_output=True, timeout=2,
+                )
+            else:
+                return []
+            if r.returncode != 0:
+                return []
+            return [x.strip() for x in r.stdout.decode("utf-8", "ignore").splitlines() if x.strip()]
+        except Exception:
+            return []
+
+    def _read_mime(self, mime: str) -> bytes | None:
+        try:
+            if self.tool == "wl-clipboard":
+                cmd = ["wl-paste", "--type", mime]
+            elif self.tool == "xclip":
+                cmd = ["xclip", "-selection", "clipboard", "-t", mime, "-o"]
+            else:
+                return None
+            r = subprocess.run(cmd, capture_output=True, timeout=4)
+            return r.stdout if r.returncode == 0 and r.stdout else None
+        except Exception:
+            return None
+
+    def _write_mime(self, mime: str, data: bytes) -> bool:
+        try:
+            if self.tool == "wl-clipboard":
+                cmd = ["wl-copy", "--type", mime]
+            elif self.tool == "xclip":
+                cmd = ["xclip", "-selection", "clipboard", "-t", mime, "-i"]
+            else:
+                return False
+            r = subprocess.run(cmd, input=data, timeout=5)
+            return r.returncode == 0
+        except Exception:
+            return False
+
+    @staticmethod
+    def _parse_uri_list(raw: bytes) -> list[str]:
+        out: list[str] = []
+        for line in raw.decode("utf-8", "ignore").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or line in ("copy", "cut"):
+                continue
+            if line.startswith("file://"):
+                u = urllib.parse.urlparse(line)
+                p = urllib.parse.unquote(u.path)
+                if os.path.exists(p):
+                    out.append(os.path.abspath(p))
+            elif os.path.isabs(line) and os.path.exists(line):
+                out.append(os.path.abspath(line))
+        return out
+
+    def read_files(self) -> list[str]:
+        targets = self._targets()
+        for mime in ("x-special/gnome-copied-files", "text/uri-list"):
+            if mime in targets:
+                raw = self._read_mime(mime)
+                if raw:
+                    files = self._parse_uri_list(raw)
+                    if files:
+                        return files
+        return []
+
+    def read_image(self) -> bytes | None:
+        targets = self._targets()
+        for mime in ("image/png", "image/bmp", "image/jpeg"):
+            if mime in targets:
+                raw = self._read_mime(mime)
+                if raw:
+                    png = image_to_png(raw)
+                    if png:
+                        return png
+        return None
+
+    def read_item(self) -> dict | None:
+        targets = self._targets()
+        for mime in ("x-special/gnome-copied-files", "text/uri-list"):
+            if mime in targets:
+                raw = self._read_mime(mime)
+                if raw:
+                    files = self._parse_uri_list(raw)
+                    if files:
+                        return {"kind": "files", "paths": files}
+        if any(t.startswith("image/") for t in targets) and "UTF8_STRING" not in targets and "text/plain" not in targets:
+            img = self.read_image()
+            if img:
+                return {"kind": "image", "data": img}
+        text = self._raw_read()
+        if text:
+            return {"kind": "text", "text": text}
+        img = self.read_image()
+        if img:
+            return {"kind": "image", "data": img}
+        return None
+
+    def write_image(self, img_bytes: bytes) -> bool:
+        png = image_to_png(img_bytes)
+        if not png:
+            return False
+        if self._write_mime("image/png", png):
+            self._cached = None
+            self._counter += 1
+            return True
+        return False
+
+    def write_files(self, paths: list[str]) -> bool:
+        norm = [os.path.abspath(p) for p in (paths or []) if p and os.path.exists(p)]
+        if not norm:
+            return False
+        uris = [urllib.parse.urljoin("file:", urllib.request.pathname2url(p)) for p in norm]
+        gnome_payload = ("copy\n" + "\n".join(uris)).encode("utf-8")
+        uri_payload = ("\r\n".join(uris) + "\r\n").encode("utf-8")
+        ok = self._write_mime("x-special/gnome-copied-files", gnome_payload) or self._write_mime(
+            "text/uri-list", uri_payload
+        )
+        if ok:
+            self._cached = None
+            self._counter += 1
+        return ok
+
+
 CLIP = None
 
 
@@ -300,7 +1166,10 @@ def default_config() -> dict:
         "peers": [],          # [{"name","host","port","token"}]
         "max_kb": 512,
         "poll_ms": 200,
-        "sync_files": False,
+        "max_file_mb": 50,
+        "sync_images": True,
+        "sync_files": True,
+        "recv_dir": "",
         "log_level": "info",   # info | debug（托盘/面板可切换）
         "fw_autocheck": True,  # 绑定/启动时自动检测防火墙与连通性
         "fw_autoopen": False,  # 检测到被拦截时自动放行（False=只在用户点确认后放行）
@@ -323,6 +1192,12 @@ def load_config() -> dict:
             cfg = {}
     base = default_config()
     changed = not os.path.exists(CONFIG_PATH)
+    # 兼容迁移：1.4.x 曾写入未使用的占位 "sync_files": false（当时无 sync_images 字段），
+    # 升级到 1.5.0 时自动开启图片与文件同步；之后若用户主动关闭则尊重用户选择。
+    if "sync_images" not in cfg and cfg.get("sync_files") is False:
+        cfg["sync_images"] = True
+        cfg["sync_files"] = True
+        changed = True
     for k, v in base.items():
         if k not in cfg:
             cfg[k] = v
@@ -333,6 +1208,10 @@ def load_config() -> dict:
     cfg["port"] = int(cfg["port"])
     cfg["max_kb"] = int(cfg["max_kb"])
     cfg["poll_ms"] = max(50, int(cfg["poll_ms"]))
+    cfg["max_file_mb"] = max(1, int(cfg.get("max_file_mb") or 50))
+    cfg["sync_images"] = bool(cfg.get("sync_images", True))
+    cfg["sync_files"] = bool(cfg.get("sync_files", True))
+    cfg["recv_dir"] = str(cfg.get("recv_dir") or "").strip()
     for p in cfg.get("peers") or []:
         p["port"] = int(p.get("port") or 8765)
     # 监听地址 / 对外公布地址：统一规整，避免空串或 "auto" 导致链接异常
@@ -532,6 +1411,11 @@ class Core:
         self.last_text = clipboard().read() or ""
         # 上一次提示「剪贴板是非文本」时的序列号，避免同一张图刷屏
         self.nontext_seq = 0
+        self.last_image_sigs: collections.deque = collections.deque(maxlen=32)
+        self.last_files_sigs: collections.deque = collections.deque(maxlen=32)
+        self.last_kind = "text"
+        self.last_summary = f"文本 {len(self.last_text)} 字" if self.last_text else "-"
+        self._snapshot_clipboard()
         self.latest = None
         self.push_count = 0
         self.recv_count = 0
@@ -582,6 +1466,11 @@ class Core:
         if peer is not None and not peer_flag(peer, "recv"):
             log.info("已拒绝来自 %s 的剪贴板（该对端被设为禁止接收）", peer_key(peer))
             return "blocked"
+        kind = str(clip.get("kind") or "text").lower()
+        if kind == "image":
+            return self._apply_remote_image(clip, who)
+        if kind == "files":
+            return self._apply_remote_files(clip, who)
         text = clip.get("text")
         if not isinstance(text, str) or text == "":
             log.info("← 收到 %s 的剪贴板，但内容为空，已忽略", who)
@@ -609,6 +1498,8 @@ class Core:
             self.latest = clip
             self.recv_count += 1
             self.last_recv_at = int(time.time())
+            self.last_kind = "text"
+            self.last_summary = f"文本 {len(text)} 字"
         if ok:
             log.info("← 收到 %s 的剪贴板 %d 字", clip.get("from") or "?", len(text))
             return "ok"
@@ -635,6 +1526,233 @@ class Core:
         self.latest = payload
         self.pusher.enqueue(payload)
         log.info("→ 推送剪贴板 %d 字 (%s)", len(text), origin)
+        self.last_kind = "text"
+        self.last_summary = f"文本 {len(text)} 字"
+
+    def _snapshot_clipboard(self) -> None:
+        """记录当前剪贴板特征，避免启动或暂停恢复时把历史图片/文件误推给对端。"""
+        try:
+            c = clipboard()
+            if hasattr(c, "read_item"):
+                it = c.read_item()
+                if it and it.get("kind") == "image" and it.get("data"):
+                    _w, _h, sig = image_info(it["data"])
+                    self.last_image_sigs.append(sig)
+                elif it and it.get("kind") == "files" and it.get("paths"):
+                    self.last_files_sigs.append(files_path_sig(it["paths"]))
+                elif it and it.get("kind") == "text":
+                    self.last_text = it.get("text") or self.last_text
+            else:
+                self.last_text = c.read() or self.last_text
+        except Exception:
+            pass
+
+    def _save_received_image(self, png_bytes: bytes) -> str:
+        """把收到的图片顺带存一份到接收目录，方便用户在面板下载或资源管理器查看。"""
+        try:
+            d = recv_dir(self.cfg)
+            fname = f"clip_{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:4]}.png"
+            dst = os.path.join(d, fname)
+            with open(dst, "wb") as f:
+                f.write(png_bytes)
+            # 最多保留最近 20 张自动落盘的剪贴板图片，避免无限堆积
+            imgs = sorted(
+                (
+                    os.path.join(d, x)
+                    for x in os.listdir(d)
+                    if x.startswith("clip_") and x.endswith(".png")
+                ),
+                key=lambda p: os.path.getmtime(p) if os.path.exists(p) else 0,
+            )
+            for old in imgs[:-20]:
+                try:
+                    os.remove(old)
+                except OSError:
+                    pass
+            return dst
+        except Exception:
+            return ""
+
+    def _apply_remote_image(self, clip: dict, who: str) -> str:
+        if not self.cfg.get("sync_images", True):
+            log.info("← 收到 %s 的图片，但本机已关闭图片同步，已忽略", who)
+            return "disabled"
+        b64 = clip.get("data_b64")
+        if not isinstance(b64, str) or not b64:
+            log.info("← 收到 %s 的图片，但数据为空，已忽略", who)
+            return "empty"
+        try:
+            raw = base64.b64decode(b64)
+        except Exception:
+            log.warning("← 收到 %s 的图片 Base64 解码失败，已忽略", who)
+            return "bad_image"
+        max_mb = max(1, int(self.cfg.get("max_file_mb") or 50))
+        if len(raw) > max_mb * 1024 * 1024:
+            log.warning(
+                "← 收到 %s 的图片 %s，超过上限 %d MB，已丢弃（调大上限：config --max-file-mb）",
+                who, fmt_size(len(raw)), max_mb,
+            )
+            return "too_large"
+        png_bytes = image_to_png(raw)
+        if not png_bytes:
+            log.warning("← 收到 %s 的图片格式无法解析，已忽略", who)
+            return "bad_image"
+        w, h, img_sig = image_info(png_bytes)
+        remote_sha = str(clip.get("sha256") or "")
+        cid = clip.get("id") or ""
+        with self.lock:
+            if cid and cid in self.seen:
+                log.debug("← 收到 %s 的图片，但该条已处理过（重试重复投递），跳过", who)
+                return "dup"
+            if cid:
+                self.seen.append(cid)
+            if img_sig in self.last_image_sigs or (remote_sha and remote_sha in self.last_image_sigs):
+                log.info("← 收到 %s 的图片，但与本机剪贴板内容完全相同，无需写入（%dx%d）", who, w, h)
+                return "same"
+            self.suppress_until = time.time() + 1.0
+            c = clipboard()
+            ok = c.write_image(png_bytes) if hasattr(c, "write_image") else False
+            self.last_seq = c.seq()
+            self.last_image_sigs.append(img_sig)
+            if remote_sha:
+                self.last_image_sigs.append(remote_sha)
+            saved = self._save_received_image(png_bytes)
+            if saved:
+                self.last_files_sigs.append(files_path_sig([saved]))
+            self.latest = {k: v for k, v in clip.items() if k != "data_b64"}
+            self.recv_count += 1
+            self.last_recv_at = int(time.time())
+            self.last_kind = "image"
+            self.last_summary = f"图片 {w}×{h} ({fmt_size(len(png_bytes))})"
+        if ok:
+            log.info("← 收到 %s 的图片 %dx%d（%s）", who, w, h, fmt_size(len(png_bytes)))
+            return "ok"
+        log.warning("图片写入剪贴板失败（可能被其它程序占用）")
+        return "write_failed"
+
+    def _apply_remote_files(self, clip: dict, who: str) -> str:
+        if not self.cfg.get("sync_files", True):
+            log.info("← 收到 %s 的文件，但本机已关闭文件同步，已忽略", who)
+            return "disabled"
+        files = clip.get("files")
+        if not isinstance(files, list) or not files:
+            log.info("← 收到 %s 的文件列表，但内容为空，已忽略", who)
+            return "empty"
+        max_mb = max(1, int(self.cfg.get("max_file_mb") or 50))
+        max_bytes = max_mb * 1024 * 1024
+        declared_size = int(clip.get("total_size") or 0)
+        if declared_size > max_bytes:
+            log.warning(
+                "← 收到 %s 的文件 %s，超过上限 %d MB，已丢弃（调大上限：config --max-file-mb）",
+                who, fmt_size(declared_size), max_mb,
+            )
+            return "too_large"
+        cid = clip.get("id") or ""
+        remote_sha = str(clip.get("sha256") or "")
+        with self.lock:
+            if cid and cid in self.seen:
+                log.debug("← 收到 %s 的文件，但该条已处理过（重试重复投递），跳过", who)
+                return "dup"
+            if cid:
+                self.seen.append(cid)
+            if remote_sha and remote_sha in self.last_files_sigs:
+                log.info("← 收到 %s 的文件，但与本机剪贴板内容完全相同，无需写入", who)
+                return "same"
+            local_paths, total_bytes, err = unpack_files_payload(clip, recv_dir(self.cfg), max_bytes)
+            if err or not local_paths:
+                if "超过上限" in (err or ""):
+                    log.warning("← 收到 %s 的文件超过上限 %d MB，已丢弃（调大上限：config --max-file-mb）", who, max_mb)
+                    return "too_large"
+                log.warning("← 收到 %s 的文件落盘失败：%s", who, err or "未知错误")
+                return "write_failed"
+            self.suppress_until = time.time() + 1.0
+            c = clipboard()
+            ok = c.write_files(local_paths) if hasattr(c, "write_files") else True
+            self.last_seq = c.seq()
+            if remote_sha:
+                self.last_files_sigs.append(remote_sha)
+            self.last_files_sigs.append(files_path_sig(local_paths))
+            names = ", ".join(os.path.basename(p) for p in local_paths[:3])
+            if len(local_paths) > 3:
+                names += f" 等 {len(local_paths)} 项"
+            self.latest = {k: v for k, v in clip.items() if k != "files"}
+            self.recv_count += 1
+            self.last_recv_at = int(time.time())
+            self.last_kind = "files"
+            self.last_summary = f"文件 {len(local_paths)} 项 ({fmt_size(total_bytes)}): {names}"
+        if ok:
+            log.info("← 收到 %s 的文件 %d 项（%s）：%s", who, len(local_paths), fmt_size(total_bytes), names)
+            return "ok"
+        log.warning("文件已保存到 %s，但写入系统剪贴板失败", recv_dir(self.cfg))
+        return "write_failed"
+
+    def broadcast_image(self, raw_bytes: bytes, origin: str = "local", write_clip: bool = True) -> dict:
+        png_bytes = image_to_png(raw_bytes)
+        if not png_bytes:
+            return {"ok": False, "error": "无法识别的图片格式"}
+        max_mb = max(1, int(self.cfg.get("max_file_mb") or 50))
+        if len(png_bytes) > max_mb * 1024 * 1024:
+            return {"ok": False, "error": f"图片大小 {fmt_size(len(png_bytes))} 超过上限 {max_mb} MB"}
+        w, h, img_sig = image_info(png_bytes)
+        with self.lock:
+            c = clipboard()
+            if write_clip and hasattr(c, "write_image"):
+                c.write_image(png_bytes)
+            self.last_seq = c.seq()
+            self.last_image_sigs.append(img_sig)
+            self.suppress_until = time.time() + 1.0
+            self.push_count += 1
+            self.last_push_at = int(time.time())
+            self.last_kind = "image"
+            self.last_summary = f"图片 {w}×{h} ({fmt_size(len(png_bytes))})"
+        payload = {
+            "id": uuid.uuid4().hex,
+            "kind": "image",
+            "mime": "image/png",
+            "width": w,
+            "height": h,
+            "size": len(png_bytes),
+            "sha256": img_sig,
+            "data_b64": base64.b64encode(png_bytes).decode("ascii"),
+            "ts": now_ms(),
+            "from": self.cfg["name"],
+        }
+        self.latest = {k: v for k, v in payload.items() if k != "data_b64"}
+        self.pusher.enqueue(payload)
+        log.info("→ 推送剪贴板图片 %dx%d（%s, %s）", w, h, fmt_size(len(png_bytes)), origin)
+        return {"ok": True, "width": w, "height": h, "size": len(png_bytes), "peers": len(self.cfg.get("peers") or [])}
+
+    def broadcast_files(self, paths: list[str], origin: str = "local", write_clip: bool = True) -> dict:
+        max_mb = max(1, int(self.cfg.get("max_file_mb") or 50))
+        payload, err = pack_files_payload(paths, self.cfg["name"], max_bytes=max_mb * 1024 * 1024)
+        if not payload:
+            return {"ok": False, "error": err or "打包文件失败"}
+        with self.lock:
+            c = clipboard()
+            if write_clip and hasattr(c, "write_files"):
+                c.write_files(paths)
+            self.last_seq = c.seq()
+            self.last_files_sigs.append(files_path_sig(paths))
+            self.last_files_sigs.append(payload["sha256"])
+            self.suppress_until = time.time() + 1.0
+            self.push_count += 1
+            self.last_push_at = int(time.time())
+            names = ", ".join(payload["roots"][:3])
+            self.last_kind = "files"
+            self.last_summary = f"文件 {len(payload['roots'])} 项 ({fmt_size(payload['total_size'])}): {names}"
+        self.latest = {k: v for k, v in payload.items() if k != "files"}
+        self.pusher.enqueue(payload)
+        log.info(
+            "→ 推送剪贴板文件 %d 项（共 %d 个文件，%s, %s）：%s",
+            len(payload["roots"]), payload["file_count"], fmt_size(payload["total_size"]), origin, names,
+        )
+        return {
+            "ok": True,
+            "count": len(payload["roots"]),
+            "file_count": payload["file_count"],
+            "size": payload["total_size"],
+            "peers": len(self.cfg.get("peers") or []),
+        }
 
 
 class Pusher(threading.Thread):
@@ -668,7 +1786,9 @@ class Pusher(threading.Thread):
         last_err = ""
         for attempt in range(3):
             try:
-                http_json(url, payload, token=peer.get("token", ""), timeout=4.0)
+                est_size = int(payload.get("total_size") or payload.get("size") or 0)
+                t_out = max(4.0, min(180.0, 4.0 + est_size / (256 * 1024)))
+                http_json(url, payload, token=peer.get("token", ""), timeout=t_out)
                 self.core.peer_state[key] = {"ok": True, "err": "", "ts": int(time.time())}
                 log.debug("推送到 %s 成功", key)
                 return
@@ -687,6 +1807,13 @@ class Pusher(threading.Thread):
                         "ok": False, "err": "对方已暂停同步", "ts": int(time.time()),
                     }
                     log.warning("推送到 %s 失败：对方处于「暂停同步」状态，内容已被丢弃", key)
+                    return
+                if exc.code == 413:
+                    self.core.peer_state[key] = {
+                        "ok": False, "err": "超过对方大小上限", "ts": int(time.time()),
+                    }
+                    log.warning("推送到 %s 被拒：内容超过对方设置的大小上限", key)
+                    return
                     return
                 last_err = f"HTTP {exc.code}"
                 if exc.code in (401, 403):
@@ -716,11 +1843,103 @@ def poller_loop(core: Core) -> None:
             core.last_seq = seq
             if core.paused:
                 # 暂停期间不推送，但记录内容，恢复后不会补发历史
-                core.last_text = clip.read() or core.last_text
+                core._snapshot_clipboard()
                 continue
             if time.time() < core.suppress_until:
                 continue  # 自己刚写入的，不回推
-            text = clip.read()
+            item = clip.read_item() if hasattr(clip, "read_item") else None
+            if item is None and not hasattr(clip, "read_item"):
+                t_fallback = clip.read()
+                if t_fallback:
+                    item = {"kind": "text", "text": t_fallback}
+            if item and item.get("kind") == "image":
+                if not core.cfg.get("sync_images", True):
+                    if core.cfg.get("sync_files", True) and hasattr(clip, "read_files"):
+                        fpaths = clip.read_files()
+                        if fpaths:
+                            item = {"kind": "files", "paths": fpaths}
+                    if item.get("kind") == "image":
+                        if core.nontext_seq != seq:
+                            core.nontext_seq = seq
+                            log.info("剪贴板内容是图片等非文本，当前已关闭图片同步（可在设置面板开启），已跳过")
+                        continue
+                if item.get("kind") == "image":
+                    png_bytes = image_to_png(item.get("data") or b"")
+                    if not png_bytes:
+                        continue
+                    max_mb = max(1, int(core.cfg.get("max_file_mb") or 50))
+                    if len(png_bytes) > max_mb * 1024 * 1024:
+                        if core.nontext_seq != seq:
+                            core.nontext_seq = seq
+                            log.warning(
+                                "剪贴板图片 %s 超过上限 %d MB，已跳过（调大上限：config --max-file-mb）",
+                                fmt_size(len(png_bytes)), max_mb,
+                            )
+                        continue
+                    w, h, img_sig = image_info(png_bytes)
+                    with core.lock:
+                        if img_sig in core.last_image_sigs:
+                            continue
+                        core.last_image_sigs.append(img_sig)
+                        core.push_count += 1
+                        core.last_push_at = int(time.time())
+                        core.last_kind = "image"
+                        core.last_summary = f"图片 {w}×{h} ({fmt_size(len(png_bytes))})"
+                    payload = {
+                        "id": uuid.uuid4().hex,
+                        "kind": "image",
+                        "mime": "image/png",
+                        "width": w,
+                        "height": h,
+                        "size": len(png_bytes),
+                        "sha256": img_sig,
+                        "data_b64": base64.b64encode(png_bytes).decode("ascii"),
+                        "ts": now_ms(),
+                        "from": core.cfg["name"],
+                    }
+                    core.latest = {k: v for k, v in payload.items() if k != "data_b64"}
+                    core.pusher.enqueue(payload)
+                    log.info("→ 检测到复制图片，推送 %dx%d（%s）", w, h, fmt_size(len(png_bytes)))
+                    continue
+            if item and item.get("kind") == "files":
+                fpaths = item.get("paths") or []
+                if not core.cfg.get("sync_files", True):
+                    if core.nontext_seq != seq:
+                        core.nontext_seq = seq
+                        log.info("剪贴板内容是文件等非文本，当前已关闭文件同步（可在设置面板开启），已跳过")
+                    continue
+                p_sig = files_path_sig(fpaths)
+                with core.lock:
+                    if p_sig in core.last_files_sigs:
+                        continue
+                max_mb = max(1, int(core.cfg.get("max_file_mb") or 50))
+                payload, err = pack_files_payload(fpaths, core.cfg["name"], max_bytes=max_mb * 1024 * 1024)
+                if not payload:
+                    if err and core.nontext_seq != seq:
+                        core.nontext_seq = seq
+                        log.warning("剪贴板文件跳过：%s", err)
+                    continue
+                with core.lock:
+                    if payload["sha256"] in core.last_files_sigs:
+                        continue
+                    core.last_files_sigs.append(p_sig)
+                    core.last_files_sigs.append(payload["sha256"])
+                    core.push_count += 1
+                    core.last_push_at = int(time.time())
+                    names = ", ".join(payload["roots"][:3])
+                    core.last_kind = "files"
+                    core.last_summary = f"文件 {len(payload['roots'])} 项 ({fmt_size(payload['total_size'])}): {names}"
+                core.latest = {k: v for k, v in payload.items() if k != "files"}
+                core.pusher.enqueue(payload)
+                log.info(
+                    "→ 检测到复制文件，推送 %d 项（共 %d 个文件，%s）：%s",
+                    len(payload["roots"]), payload["file_count"], fmt_size(payload["total_size"]), names,
+                )
+                continue
+            text = item.get("text") if (item and item.get("kind") == "text") else None
+            if False:
+                continue  # 自己刚写入的，不回推
+            text = item.get("text") if (item and item.get("kind") == "text") else None
             if not text:
                 # 图片 / 文件等非文本：本工具只同步纯文本，这里必须留一条日志，
                 # 否则用户复制一张图会表现为「完全没反应」，以为程序坏了。
@@ -747,6 +1966,8 @@ def poller_loop(core: Core) -> None:
             core.latest = payload
             core.pusher.enqueue(payload)
             log.info("→ 检测到复制，推送 %d 字", len(text))
+            core.last_kind = "text"
+            core.last_summary = f"文本 {len(text)} 字"
         except Exception as exc:
             log.debug("轮询异常: %s", exc)
 
@@ -785,7 +2006,7 @@ class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"ClipShare/{VERSION}"
     sys_version = ""
-    timeout = 20
+    timeout = 120
 
     def log_message(self, fmt, *args):
         log.debug("http " + (fmt % args))
@@ -813,7 +2034,11 @@ class Handler(BaseHTTPRequestHandler):
             n = int(self.headers.get("Content-Length") or 0)
         except ValueError:
             return None
-        limit = (CORE.cfg["max_kb"] * 1024 * 4) if CORE else 4 * 1024 * 1024
+        if CORE:
+            max_file_bytes = max(1, int(CORE.cfg.get("max_file_mb", 50) or 50)) * 1024 * 1024
+            limit = max(int(CORE.cfg.get("max_kb", 512)) * 1024 * 4, int(max_file_bytes * 1.45) + 262144)
+        else:
+            limit = 80 * 1024 * 1024
         if n <= 0 or n > limit:
             return None
         raw = self.rfile.read(n)
@@ -840,6 +2065,67 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _list_received(self) -> list[dict]:
+        rdir = recv_dir(CORE.cfg if CORE else None)
+        if not os.path.isdir(rdir):
+            return []
+        rows: list[dict] = []
+        try:
+            for entry in os.scandir(rdir):
+                try:
+                    st = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                is_dir = entry.is_dir(follow_symlinks=False)
+                size = 0 if is_dir else int(st.st_size)
+                rows.append({
+                    "name": entry.name,
+                    "is_dir": is_dir,
+                    "size": size,
+                    "mtime": int(st.st_mtime),
+                })
+        except OSError:
+            return []
+        rows.sort(key=lambda x: x["mtime"], reverse=True)
+        return rows[:100]
+
+    def _serve_received_download(self, qs: dict) -> None:
+        name = (qs.get("name") or [""])[0]
+        rel = _safe_rel_path(name)
+        if not rel or "/" in rel:
+            return self._json(400, {"ok": False, "error": "文件名不合法"})
+        rdir = recv_dir(CORE.cfg if CORE else None)
+        full = os.path.abspath(os.path.join(rdir, rel))
+        if os.path.commonpath([os.path.abspath(rdir), full]) != os.path.abspath(rdir):
+            return self._json(403, {"ok": False, "error": "禁止越界访问"})
+        if not os.path.isfile(full):
+            return self._json(404, {"ok": False, "error": "文件不存在或为文件夹"})
+        try:
+            with open(full, "rb") as f:
+                data = f.read()
+        except OSError as exc:
+            return self._json(500, {"ok": False, "error": str(exc)})
+        ext = os.path.splitext(full)[1].lower()
+        ctype = {
+            ".png": "image/png",
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".bmp": "image/bmp",
+            ".txt": "text/plain; charset=utf-8",
+            ".pdf": "application/pdf",
+        }.get(ext, "application/octet-stream")
+        disp_type = "inline" if ctype.startswith("image/") else "attachment"
+        encoded_name = urllib.parse.quote(os.path.basename(full))
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.send_header("Content-Disposition", f"{disp_type}; filename*=UTF-8''{encoded_name}")
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(data)
+
     # ---- 路由 ----
     def do_GET(self):
         path = urllib.parse.urlparse(self.path)
@@ -855,6 +2141,19 @@ class Handler(BaseHTTPRequestHandler):
             if not ok:
                 return self._html("<h1>401</h1><p>令牌无效，请从托盘菜单重新打开设置面板。</p>", 401)
             return self._html(HTML_UI)
+
+        if path.path == "/api/received/download":
+            qs = urllib.parse.parse_qs(path.query)
+            t = (qs.get("t") or [""])[0]
+            authed = self._authed()
+            if not authed and t:
+                try:
+                    authed = hmac.compare_digest(t, CORE.cfg["token"])
+                except Exception:
+                    authed = False
+            if not authed:
+                return self._json(401, {"ok": False, "error": "unauthorized"})
+            return self._serve_received_download(qs)
 
         if not self._authed():
             return self._json(401, {"ok": False, "error": "unauthorized"})
@@ -900,6 +2199,15 @@ class Handler(BaseHTTPRequestHandler):
             except ValueError:
                 n = 200
             return self._json(200, {"ok": True, "text": tail_log(n)})
+        if path.path == "/api/received":
+            return self._json(
+                200,
+                {
+                    "ok": True,
+                    "dir": recv_dir(CORE.cfg),
+                    "items": self._list_received(),
+                },
+            )
         if path.path == "/api/config":
             cfg = CORE.cfg
             return self._json(
@@ -913,6 +2221,11 @@ class Handler(BaseHTTPRequestHandler):
                         "advertise": cfg.get("advertise", ""),
                         "port_auto": bool(cfg.get("port_auto", True)),
                         "max_kb": cfg["max_kb"],
+                        "max_file_mb": int(cfg.get("max_file_mb", 50) or 50),
+                        "sync_images": bool(cfg.get("sync_images", True)),
+                        "sync_files": bool(cfg.get("sync_files", True)),
+                        "recv_dir": str(cfg.get("recv_dir") or ""),
+                        "recv_dir_actual": recv_dir(cfg),
                         "poll_ms": cfg["poll_ms"],
                         "log_level": cfg.get("log_level", "info"),
                         "fw_autocheck": bool(cfg.get("fw_autocheck", True)),
@@ -959,6 +2272,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._json(400, {"ok": False, "error": "bad_json"})
             src = (self.client_address[0] if self.client_address else "") or ""
             res = CORE.apply_remote(body, src=src)
+            if res == "disabled":
+                return self._json(403, {"ok": False, "result": res,
+                                        "error": "本机未开启图片或文件同步"})
+            if res == "too_large":
+                return self._json(413, {"ok": False, "result": res,
+                                        "error": "图片或文件超过本机大小上限"})
             if res == "blocked":
                 return self._json(403, {"ok": False, "result": res,
                                         "error": "本机已把该对端设为禁止接收"})
@@ -971,7 +2290,77 @@ class Handler(BaseHTTPRequestHandler):
 
         if path == "/api/broadcast":
             body = self._body()
-            if not isinstance(body, dict) or not isinstance(body.get("text"), str):
+            if not isinstance(body, dict):
+                return self._json(400, {"ok": False, "error": "bad_json"})
+            kind = str(body.get("kind") or "text").lower()
+            if kind == "image":
+                data_b64 = str(body.get("data_b64") or "").strip()
+                img_path = str(body.get("path") or "").strip()
+                raw = b""
+                if img_path:
+                    try:
+                        with open(img_path, "rb") as f:
+                            raw = f.read()
+                    except OSError as exc:
+                        return self._json(400, {"ok": False, "error": f"读取图片失败：{exc}"})
+                elif data_b64:
+                    try:
+                        raw = base64.b64decode(data_b64)
+                    except Exception:
+                        return self._json(400, {"ok": False, "error": "图片编码无效"})
+                png = image_to_png(raw) if raw else None
+                if not png:
+                    return self._json(400, {"ok": False, "error": "无法解析图片（支持 PNG/BMP/JPG/GIF/WebP）"})
+                max_bytes = max(1, int(CORE.cfg.get("max_file_mb", 50) or 50)) * 1024 * 1024
+                if len(png) > max_bytes:
+                    return self._json(413, {"ok": False, "error": f"图片超过大小上限（{fmt_size(len(png))} > {CORE.cfg.get('max_file_mb', 50)} MB）"})
+                res = CORE.broadcast_image(png, origin="cli", write_clip=bool(body.get("write_clip", True)))
+                return self._json(200, res)
+            if kind == "files":
+                max_bytes = max(1, int(CORE.cfg.get("max_file_mb", 50) or 50)) * 1024 * 1024
+                write_clip = bool(body.get("write_clip", True))
+                paths = body.get("paths")
+                if isinstance(paths, list) and paths:
+                    res = CORE.broadcast_files([str(x) for x in paths], origin="cli", write_clip=write_clip)
+                    return self._json(200 if res.get("ok") else 400, res)
+                up_files = body.get("files")
+                if isinstance(up_files, list) and up_files:
+                    rdir = recv_dir(CORE.cfg)
+                    os.makedirs(rdir, exist_ok=True)
+                    stage_paths: list[str] = []
+                    for item in up_files:
+                        if not isinstance(item, dict):
+                            continue
+                        rel = _safe_rel_path(str(item.get("name") or ""))
+                        b64 = str(item.get("data_b64") or "")
+                        if not rel or not b64:
+                            continue
+                        try:
+                            raw = base64.b64decode(b64)
+                        except Exception:
+                            return self._json(400, {"ok": False, "error": f"文件编码无效：{rel}"})
+                        if len(raw) > max_bytes:
+                            return self._json(413, {"ok": False, "error": f"文件过大：{rel}（{fmt_size(len(raw))}）"})
+                        dst = os.path.join(rdir, os.path.basename(rel))
+                        with open(dst, "wb") as f:
+                            f.write(raw)
+                        stage_paths.append(dst)
+                    if not stage_paths:
+                        return self._json(400, {"ok": False, "error": "没有有效文件"})
+                    # 如果单张图片且来自网页上传，直接按图片同步体验更好
+                    if len(stage_paths) == 1 and os.path.splitext(stage_paths[0])[1].lower() in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp") and bool(body.get("auto_image", True)):
+                        try:
+                            with open(stage_paths[0], "rb") as f:
+                                png = image_to_png(f.read())
+                        except OSError:
+                            png = None
+                        if png:
+                            res = CORE.broadcast_image(png, origin="webui", write_clip=write_clip)
+                            return self._json(200 if res.get("ok") else 400, res)
+                    res = CORE.broadcast_files(stage_paths, origin="webui", write_clip=write_clip)
+                    return self._json(200 if res.get("ok") else 400, res)
+                return self._json(400, {"ok": False, "error": "未提供文件路径或上传数据"})
+            if not isinstance(body.get("text"), str):
                 return self._json(400, {"ok": False, "error": "bad_json"})
             CORE.broadcast(body["text"], origin="cli")
             return self._json(200, {"ok": True, "peers": len(CORE.cfg.get("peers") or [])})
@@ -1205,6 +2594,20 @@ class Handler(BaseHTTPRequestHandler):
             log.info("同步已%s", "暂停" if CORE.paused else "恢复")
             return self._json(200, {"ok": True, "paused": CORE.paused})
 
+        if path == "/api/received/open":
+            rdir = recv_dir(CORE.cfg)
+            os.makedirs(rdir, exist_ok=True)
+            try:
+                if os.name == "nt":
+                    os.startfile(rdir)  # type: ignore[attr-defined]
+                elif sys.platform == "darwin":
+                    subprocess.Popen(["open", rdir])
+                else:
+                    subprocess.Popen(["xdg-open", rdir])
+                return self._json(200, {"ok": True, "dir": rdir})
+            except Exception as exc:
+                return self._json(500, {"ok": False, "error": str(exc), "dir": rdir})
+
         if path == "/api/config":
             body = self._body()
             if not isinstance(body, dict):
@@ -1214,7 +2617,32 @@ class Handler(BaseHTTPRequestHandler):
                 apply_log_level(CORE.cfg)
                 save_config(CORE.cfg)
                 log.info("日志级别切换为 %s", CORE.cfg["log_level"])
-            for key in ("fw_autocheck", "fw_autoopen"):
+            for key in ("fw_autocheck", "fw_autoopen", "sync_images", "sync_files"):
+                if key in body:
+                    CORE.cfg[key] = bool(body[key])
+                    save_config(CORE.cfg)
+            if "max_file_mb" in body:
+                try:
+                    CORE.cfg["max_file_mb"] = max(1, min(500, int(body["max_file_mb"])))
+                    save_config(CORE.cfg)
+                except (TypeError, ValueError):
+                    pass
+            if "max_kb" in body:
+                try:
+                    CORE.cfg["max_kb"] = max(16, min(65536, int(body["max_kb"])))
+                    save_config(CORE.cfg)
+                except (TypeError, ValueError):
+                    pass
+            if "recv_dir" in body:
+                r_val = str(body.get("recv_dir") or "").strip()
+                if r_val:
+                    try:
+                        os.makedirs(os.path.abspath(os.path.expanduser(r_val)), exist_ok=True)
+                    except OSError as exc:
+                        return self._json(400, {"ok": False, "error": f"目录不可用：{exc}"})
+                CORE.cfg["recv_dir"] = r_val
+                save_config(CORE.cfg)
+            for key in ():
                 if key in body:
                     CORE.cfg[key] = bool(body[key])
                     save_config(CORE.cfg)
@@ -1235,6 +2663,12 @@ class Handler(BaseHTTPRequestHandler):
                     "fw_autocheck": bool(CORE.cfg.get("fw_autocheck", True)),
                     "fw_autoopen": bool(CORE.cfg.get("fw_autoopen", False)),
                     "fw_mode": CORE.cfg.get("fw_mode", "temp"),
+                    "sync_images": bool(CORE.cfg.get("sync_images", True)),
+                    "sync_files": bool(CORE.cfg.get("sync_files", True)),
+                    "max_file_mb": int(CORE.cfg.get("max_file_mb", 50) or 50),
+                    "max_kb": int(CORE.cfg.get("max_kb", 512) or 512),
+                    "recv_dir": str(CORE.cfg.get("recv_dir") or ""),
+                    "recv_dir_actual": recv_dir(CORE.cfg),
                 },
             )
 
@@ -1370,6 +2804,13 @@ class Handler(BaseHTTPRequestHandler):
             "last_push_at": CORE.last_push_at,
             "last_recv_at": CORE.last_recv_at,
             "clip_len": len(CORE.last_text or ""),
+            "last_kind": CORE.last_kind,
+            "last_summary": CORE.last_summary,
+            "sync_images": bool(cfg.get("sync_images", True)),
+            "sync_files": bool(cfg.get("sync_files", True)),
+            "max_file_mb": int(cfg.get("max_file_mb", 50) or 50),
+            "recv_dir": str(cfg.get("recv_dir") or ""),
+            "recv_dir_actual": recv_dir(cfg),
         }
 
 
@@ -3639,6 +5080,20 @@ def _copy_my_link() -> str:
     return link
 
 
+def _open_recv_dir() -> None:
+    rdir = recv_dir(CORE.cfg if CORE else None)
+    os.makedirs(rdir, exist_ok=True)
+    try:
+        if os.name == "nt":
+            os.startfile(rdir)  # type: ignore[attr-defined]
+        elif sys.platform == "darwin":
+            subprocess.Popen(["open", rdir])
+        else:
+            subprocess.Popen(["xdg-open", rdir])
+    except Exception as exc:
+        log.warning("打开接收目录失败: %s", exc)
+
+
 def _open_log_file() -> None:
     try:
         if os.name == "nt":
@@ -3719,6 +5174,8 @@ def cmd_gui(args, cfg: dict) -> int:
         "autostart": autostart_installed,
         "toggle_autostart": _toggle_autostart,
         "copy_link": _copy_my_link,
+        "copy_link": _copy_my_link,
+        "open_recv": _open_recv_dir,
         "open_log": _open_log_file,
         "shutdown": _shutdown,
         "fw_label": lambda: f"防火墙放行 TCP {CORE.cfg['port']}"
@@ -3783,7 +5240,13 @@ def cmd_status(args, cfg: dict) -> int:
         print(f"最近推送：{time.strftime('%H:%M:%S', time.localtime(st['last_push_at']))}")
     if st["last_recv_at"]:
         print(f"最近接收：{time.strftime('%H:%M:%S', time.localtime(st['last_recv_at']))}")
-    print(f"剪贴板缓存：{st['clip_len']} 字")
+    print(f"剪贴板缓存：{st.get('last_summary') or (str(st['clip_len']) + ' 字')}")
+    print(
+        f"能力开关  ：图片={'开启' if st.get('sync_images', True) else '关闭'}"
+        f"  文件={'开启' if st.get('sync_files', True) else '关闭'}"
+        f"  上限={st.get('max_file_mb', 50)}MB"
+        f"  接收目录={st.get('recv_dir_actual', RECV_DIR)}"
+    )
     peers = st.get("peers") or []
     if not peers:
         print("对端：未绑定（用 bind 命令绑定配对链接）")
@@ -4091,6 +5554,75 @@ def cmd_update(args, cfg: dict) -> int:
 
 
 def cmd_send(args, cfg: dict) -> int:
+    img_path = getattr(args, "image", None)
+    file_list = getattr(args, "files", None) or []
+    as_file = bool(getattr(args, "as_file", False))
+
+    # 如果 --file 指向的是图片/二进制/目录，或显式带了 --as-file，自动走图片/文件发送
+    if args.file and not img_path and not file_list:
+        p = os.path.abspath(args.file)
+        ext = os.path.splitext(p)[1].lower()
+        if as_file or os.path.isdir(p):
+            file_list = [p]
+        elif ext in (".png", ".jpg", ".jpeg", ".bmp", ".gif", ".webp"):
+            img_path = p
+
+    if img_path:
+        p = os.path.abspath(img_path)
+        if not os.path.isfile(p):
+            print(f"图片不存在：{p}")
+            return 2
+        with open(p, "rb") as f:
+            png = image_to_png(f.read())
+        if not png:
+            print(f"无法解析图片文件（支持 PNG/BMP/JPG/GIF/WebP）：{p}")
+            return 2
+        if service_alive(cfg):
+            _, obj = service_call(cfg, "/api/broadcast", {"kind": "image", "path": p}, timeout=60)
+            if not obj.get("ok"):
+                print(f"发送图片失败：{obj.get('error')}")
+                return 1
+            print(f"已写入本机剪贴板并推送图片（{obj.get('width', 0)}×{obj.get('height', 0)}, {fmt_size(int(obj.get('size') or len(png)))}）→ {obj.get('peers', 0)} 个对端")
+            return 0
+        clipboard().write_image(png)
+        print("服务未运行：只把图片写入了本机剪贴板，未推送给对端。")
+        return 1
+
+    if file_list:
+        abs_paths = [os.path.abspath(x) for x in file_list]
+        missing = [x for x in abs_paths if not os.path.exists(x)]
+        if missing:
+            print("文件不存在：" + ", ".join(missing))
+            return 2
+        if service_alive(cfg):
+            _, obj = service_call(cfg, "/api/broadcast", {"kind": "files", "paths": abs_paths}, timeout=120)
+            if not obj.get("ok"):
+                print(f"发送文件失败：{obj.get('error')}")
+                return 1
+            print(f"已写入本机剪贴板并推送 {obj.get('count', len(abs_paths))} 项文件（共 {fmt_size(int(obj.get('size') or 0))}）→ {obj.get('peers', 0)} 个对端")
+            return 0
+        clipboard().write_files(abs_paths)
+        print("服务未运行：只把文件写入了本机剪贴板，未推送给对端。")
+        return 1
+
+    if args.file:
+        try:
+            with open(args.file, "r", encoding=args.encoding) as f:
+                text = f.read()
+        except UnicodeDecodeError:
+            # 二进制文件自动降级按文件对象发送
+            abs_p = os.path.abspath(args.file)
+            if service_alive(cfg):
+                _, obj = service_call(cfg, "/api/broadcast", {"kind": "files", "paths": [abs_p]}, timeout=120)
+                if not obj.get("ok"):
+                    print(f"发送文件失败：{obj.get('error')}")
+                    return 1
+                print(f"已按文件对象推送：{os.path.basename(abs_p)}（{fmt_size(int(obj.get('size') or 0))}）→ {obj.get('peers', 0)} 个对端")
+                return 0
+            clipboard().write_files([abs_p])
+            print("服务未运行：只把文件写入了本机剪贴板，未推送给对端。")
+            return 1
+        pass
     if args.file:
         with open(args.file, "r", encoding=args.encoding) as f:
             text = f.read()
@@ -4173,6 +5705,19 @@ def cmd_config(args, cfg: dict) -> int:
         dirty = True
     if getattr(args, "auto_update", None) is not None:
         cfg["auto_update"] = bool(args.auto_update)
+        dirty = True
+    if getattr(args, "sync_images", None) is not None:
+        cfg["sync_images"] = bool(args.sync_images)
+        dirty = True
+    if getattr(args, "sync_files", None) is not None:
+        cfg["sync_files"] = bool(args.sync_files)
+        dirty = True
+    if getattr(args, "max_file_mb", None):
+        cfg["max_file_mb"] = max(1, min(500, int(args.max_file_mb)))
+        dirty = True
+    if getattr(args, "recv_dir", None) is not None:
+        r_val = str(args.recv_dir).strip()
+        cfg["recv_dir"] = "" if r_val.lower() in ("default", "默认") else r_val
         dirty = True
     if args.max_kb:
         cfg["max_kb"] = int(args.max_kb)
@@ -4304,6 +5849,10 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("text", nargs="*")
     s.add_argument("--file")
     s.add_argument("--encoding", default="utf-8")
+    s.add_argument("--image", help="发送图片文件到剪贴板并同步给对端")
+    s.add_argument("--files", nargs="+", help="发送一个或多个文件/文件夹到剪贴板并同步给对端")
+    s.add_argument("--as-file", dest="as_file", action="store_true",
+                   help="把 --file 指定的文件作为文件对象（而非读取文本内容）发送")
     s.set_defaults(fn=cmd_send)
 
     s = sub.add_parser("install", help="安装开机自启并启动")
@@ -4324,7 +5873,17 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-port-auto", dest="port_auto", action="store_false",
                    help="端口被占用时直接报错，不自动换")
     s.add_argument("--name")
-    s.add_argument("--max-kb", dest="max_kb", type=int)
+    s.add_argument("--max-kb", dest="max_kb", type=int, help="单条文本最大 KB（默认 512）")
+    s.add_argument("--max-file-mb", dest="max_file_mb", type=int, help="单次图片/文件最大 MB（默认 50）")
+    s.add_argument("--sync-images", dest="sync_images", action="store_true", default=None,
+                   help="开启图片剪贴板同步")
+    s.add_argument("--no-sync-images", dest="sync_images", action="store_false",
+                   help="关闭图片剪贴板同步")
+    s.add_argument("--sync-files", dest="sync_files", action="store_true", default=None,
+                   help="开启文件剪贴板同步")
+    s.add_argument("--no-sync-files", dest="sync_files", action="store_false",
+                   help="关闭文件剪贴板同步")
+    s.add_argument("--recv-dir", dest="recv_dir", help="接收文件保存目录（传 default 恢复默认）")
     s.add_argument("--poll-ms", dest="poll_ms", type=int)
     s.add_argument("--new-token", dest="new_token", action="store_true")
     s.add_argument("--auto-update", dest="auto_update", action="store_true", default=None,

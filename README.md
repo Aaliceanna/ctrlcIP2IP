@@ -1,6 +1,6 @@
 # ClipShare
 
-通过**指定 IP** 的端到端剪贴板共享。Windows / Linux，Ctrl+C 之后自动把剪贴板文本推送到已绑定的对端，对端复制也会回推过来。
+通过**指定 IP** 的端到端剪贴板共享。Windows / Linux，Ctrl+C 之后自动把剪贴板**文本、图片（截图/复制图片）、文件与文件夹**推送到已绑定的对端，对端直接 Ctrl+V 即可粘贴，双向同步。
 
 **双击就常驻托盘，不再是一闪就没的命令行程序。**
 
@@ -13,6 +13,7 @@
 - **防火墙一键放行**：面板里点一下就开端口，**软件关闭 / 闪退 / 被强杀后自动恢复**，不留洞口
 - **单一实例**：同一台机器只会有一个 ClipShare 在跑，重复双击不会起第二个（会直接打开已经在跑的那个的设置面板）
 - **自动更新**：每 6 小时查一次 GitHub Release，有新版就下载安装并自动重启；也可以关掉自动，只在面板里手动点
+- **文本 + 图片 + 文件全支持**：不仅同步纯文本，截图/复制图片（Windows `CF_DIB`/`PNG`、Linux `image/png`）和资源管理器 Ctrl+C 复制的文件/文件夹（`CF_HDROP` / `uri-list`）也能直接跨机 Ctrl+V 粘贴
 - **对端单独管控**：每个对端都能单独「禁止推送 / 禁止接收 / 全禁止」，可勾选多个批量操作批量解绑
 
 > **怎么关？** 右键托盘图标 → **退出 ClipShare**。命令行也能 `clipshare-cli.exe stop`。
@@ -208,7 +209,7 @@ loginctl enable-linger $USER   # 未登录也常驻（可选）
 | `clipshare link [--wan]` | 生成配对链接，`--wan` 用公网 IP |
 | `clipshare bind "<链接>"` | 绑定对端（会立即握手验证，**并让对方回绑本机**；加 `--one-way` 只单向添加） |
 | `clipshare peers` | 探测所有对端是否可达 |
-| `clipshare send "文本"` | 写入本机剪贴板并推送 |
+| `clipshare send "文本"` | 写入本机剪贴板并推送（亦支持 `--image <图片>`、`--files <文件/文件夹…>`） |
 | `clipshare unbind <IP:端口>` | 解绑（默认同时通知对方删除本机，加 `--local-only` 只删本机） |
 | `clipshare fw` | 防火墙体检：是否开启、端口是否放行、服务是否在监听 |
 | `clipshare fw --open [--mode persist]` | 一键放行端口（默认临时规则，退出自动恢复） |
@@ -271,7 +272,8 @@ clipshare-cli.exe config --no-port-auto
 - 所有 API 需要 32 字节随机令牌（`X-Token` 头，`hmac.compare_digest` 比对），令牌内嵌在配对链接里，**配对链接等同于密码，不要外发**
 - 设置面板地址形如 `http://127.0.0.1:8765/ui?t=令牌`，令牌不对直接 401
 - 传输为明文 HTTP，仅在可信网络或 VPN 内使用；暴露公网请换随机高端口并定期 `config --new-token`
-- 只同步纯文本，单条超过 `max_kb`（默认 512KB）跳过 —— **图片、文件、文件夹不会被同步**，复制这些内容时日志会明确写一条「非文本，暂不支持」，不再是毫无反应
+- 支持同步**纯文本**（默认上限 `max_kb` = 512KB）、**剪贴板图片**与**文件/文件夹**（默认单次上限 `max_file_mb` = 50MB）；图片与文件同步可在设置面板或命令行单独开关（`--sync-images` / `--no-sync-images`、`--sync-files` / `--no-sync-files`）
+- 接收到的文件默认保存在 `%LOCALAPPDATA%\ClipShare\received`（Linux 为 `~/.local/share/ClipShare/received`，可通过 `recv_dir` 自定义），并自动写入本机剪贴板 `CF_HDROP`，在资源管理器、桌面或聊天窗口直接 Ctrl+V 即可粘贴出原文件
 
 ---
 
@@ -292,7 +294,11 @@ clipshare-cli.exe config --no-port-auto
   "peers": [{ "name": "PC-B", "host": "192.168.1.184", "port": 8765, "token": "对方令牌",
               "mutual": true, "push": true, "recv": true }],
   "max_kb": 512,
+  "max_file_mb": 50,
   "poll_ms": 200,
+  "sync_images": true,
+  "sync_files": true,
+  "recv_dir": "",
   "log_level": "info",
   "fw_autocheck": true,
   "fw_autoopen": false,
@@ -380,9 +386,9 @@ Windows 11 默认折叠新图标，点任务栏 `^` 展开，或把它拖到常�
 
 | 日志里写的 | 意思 | 怎么解决 |
 | --- | --- | --- |
-| `非文本，暂不支持同步` | 你复制的是图片/文件 | 本工具只同步纯文本，换成复制文字 |
+| `已关闭图片同步 / 已关闭文件同步` | 你复制了图片或文件，但对应开关被关了 | 设置面板勾选「允许同步剪贴板图片 / 文件」 |
 | `与本机剪贴板内容完全相同` | 两边内容本来就一样 | 不用处理，确实是同步着的 |
-| `超过上限 xxx KB，已丢弃` | 单条太大 | `config --max-kb 2048` 调大后重启 |
+| `超过上限 xxx KB / MB，已丢弃` | 单条文本或文件太大 | 面板调大上限，或 `config --max-kb 2048 --max-file-mb 200` |
 | `本机已暂停同步` | 接收端点了暂停 | 接收端托盘勾上「启用同步」 |
 | `对方处于「暂停同步」状态` | 发送成功但被对方丢弃 | 同上，去对方机器恢复 |
 | `该对端被设为禁止接收` | 对方把这个对端关了接收 | 对方面板点「恢复收发」 |

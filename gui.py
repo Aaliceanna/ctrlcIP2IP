@@ -57,6 +57,7 @@ class TrayApp:
             MenuItem("复制我的配对链接", self._copy_link),
             MenuItem(lambda i: self.h["fw_label"](), self._toggle_fw,
                      checked=lambda i: self.h["fw_open"]()),
+            MenuItem("打开接收文件目录", self._open_recv),
             MenuItem("打开日志文件", self._open_log),
             MenuItem("开机自启", self._toggle_autostart, checked=lambda i: self.h["autostart"]()),
             MenuItem(lambda i: self.h.get("update_label", lambda: "检查更新…")(),
@@ -106,6 +107,11 @@ class TrayApp:
         except Exception as exc:
             msg = f"检查更新失败：{exc}"
         self._notify(msg or "检查完成")
+
+    def _open_recv(self, icon=None, item=None) -> None:
+        fn = self.h.get("open_recv")
+        if fn:
+            fn()
 
     def _open_log(self, icon=None, item=None) -> None:
         self.h["open_log"]()

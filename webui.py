@@ -93,6 +93,7 @@ HTML_UI = r"""<!DOCTYPE html>
       <div><label>已绑定对端</label><div id="peersCount">-</div></div>
       <div><label>推送 / 接收</label><div id="counts">-</div></div>
       <div><label>最近接收</label><div id="lastRecv">-</div></div>
+      <div><label>最近内容</label><div id="lastSummary">-</div></div>
     </div>
   </section>
 
@@ -203,6 +204,48 @@ HTML_UI = r"""<!DOCTYPE html>
   </section>
 
   <section class="card">
+    <h2>图片与文件同步 <span class="tag" id="mediaTag">已启用</span></h2>
+    <label class="switch"><input type="checkbox" id="swSyncImages" checked onchange="saveMediaOpts()"> 允许同步剪贴板图片（截图 / 复制图片后自动推送，对端可直接 Ctrl+V 粘贴）</label>
+    <label class="switch"><input type="checkbox" id="swSyncFiles" checked onchange="saveMediaOpts()"> 允许同步剪贴板文件与文件夹（资源管理器 Ctrl+C 复制后，对端可直接 Ctrl+V 粘贴）</label>
+    <div class="netrow">
+      <label>图片 / 文件单次上限 (MB)
+        <input id="inpMaxFileMb" inputmode="numeric" placeholder="50">
+      </label>
+      <label>纯文本单条上限 (KB)
+        <input id="inpMaxKb" inputmode="numeric" placeholder="512">
+      </label>
+    </div>
+    <div class="netrow one">
+      <label>接收文件保存目录（留空使用默认目录）
+        <input id="inpRecvDir" placeholder="默认目录">
+      </label>
+    </div>
+    <div class="row">
+      <button class="primary" onclick="saveMediaLimits()">保存参数</button>
+      <button onclick="openRecvDir()">打开接收文件目录</button>
+    </div>
+    <details style="margin-top:10px">
+      <summary>在网页中直接选择文件 / 图片推送到对端，或查看已接收文件</summary>
+      <div class="row" style="margin-top:8px;align-items:center;flex-wrap:wrap">
+        <input type="file" id="filePicker" multiple style="flex:1;min-width:200px">
+        <button class="primary" onclick="sendPickedFiles(false)">作为文件推送</button>
+        <button onclick="sendPickedFiles(true)">作为剪贴板图片推送</button>
+      </div>
+      <div id="sendFileMsg" class="hint"></div>
+      <div style="margin-top:10px">
+        <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+          <b style="font-size:12px;color:var(--muted)">最近接收的文件 / 图片</b>
+          <button class="mini" onclick="loadReceived()">刷新列表</button>
+        </div>
+        <table>
+          <thead><tr><th>文件名</th><th>大小</th><th>时间</th><th></th></tr></thead>
+          <tbody id="recvRows"><tr><td colspan="4" style="color:#6b7280">暂无接收文件</td></tr></tbody>
+        </table>
+      </div>
+    </details>
+  </section>
+
+  <section class="card">
     <h2>开关</h2>
     <label class="switch"><input type="checkbox" id="swSync" onchange="setPause(this)"> 启用同步（取消勾选则暂停收发）</label>
     <label class="switch"><input type="checkbox" id="swDebug" onchange="setDebug(this)"> 详细日志（debug 级别，排查问题用）</label>
@@ -255,6 +298,7 @@ async function refresh(){
     document.getElementById('peersCount').textContent = s.peers.length + ' 个';
     document.getElementById('counts').textContent = s.push_count + ' / ' + s.recv_count;
     document.getElementById('lastRecv').textContent = fmtTime(s.last_recv_at);
+    document.getElementById('lastSummary').textContent = s.last_summary || ('文本 ' + (s.clip_len||0) + ' 字');
     const st = document.getElementById('state');
     st.textContent = s.paused ? '已暂停' : '运行中';
     st.className = 'badge' + (s.paused ? ' off' : '');
@@ -284,9 +328,20 @@ async function refresh(){
     const cfg = await api('/api/config');
     const c = cfg.config || {};
     const ae = document.activeElement;
-    if (!ae || ['swFwCheck','swFwAuto'].indexOf(ae.id) < 0){
+    if (!ae || ['swFwCheck','swFwAuto','swSyncImages','swSyncFiles','inpMaxFileMb','inpMaxKb','inpRecvDir'].indexOf(ae.id) < 0){
       document.getElementById('swFwCheck').checked = c.fw_autocheck !== false;
       document.getElementById('swFwAuto').checked = !!c.fw_autoopen;
+      document.getElementById('swSyncImages').checked = c.sync_images !== false;
+      document.getElementById('swSyncFiles').checked = c.sync_files !== false;
+      document.getElementById('inpMaxFileMb').value = c.max_file_mb || 50;
+      document.getElementById('inpMaxKb').value = c.max_kb || 512;
+      document.getElementById('inpRecvDir').value = c.recv_dir || '';
+      document.getElementById('inpRecvDir').placeholder = c.recv_dir_actual || '默认目录';
+    }
+    const mtag = document.getElementById('mediaTag');
+    if (mtag){
+      const si = c.sync_images !== false, sf = c.sync_files !== false;
+      mtag.textContent = (si && sf) ? '图片+文件已开启' : (si ? '仅图片' : (sf ? '仅文件' : '仅纯文本'));
     }
   }catch(e){
     document.getElementById('state').textContent='连接失败';
@@ -608,6 +663,120 @@ async function setAutostart(el){
   }catch(e){ toast('操作失败'); }
 }
 
+/* ---------- 图片与文件同步设置 / 收发 ---------- */
+async function saveMediaOpts(){
+  const sync_images = document.getElementById('swSyncImages').checked;
+  const sync_files = document.getElementById('swSyncFiles').checked;
+  try{
+    await api('/api/config', {sync_images, sync_files});
+    toast('已更新图片/文件同步开关');
+    refresh();
+  }catch(e){ toast('保存失败：' + e.message); }
+}
+
+async function saveMediaLimits(){
+  const max_file_mb = parseInt(document.getElementById('inpMaxFileMb').value.trim(), 10) || 50;
+  const max_kb = parseInt(document.getElementById('inpMaxKb').value.trim(), 10) || 512;
+  const recv_dir = document.getElementById('inpRecvDir').value.trim();
+  if (max_file_mb < 1 || max_kb < 1) return toast('大小上限必须大于 0');
+  try{
+    const r = await api('/api/config', {max_file_mb, max_kb, recv_dir});
+    if (!r.ok) return toast('保存失败：' + (r.error || ''));
+    toast('已保存同步参数');
+    refresh();
+  }catch(e){ toast('保存失败：' + e.message); }
+}
+
+async function openRecvDir(){
+  try{
+    const r = await api('/api/received/open', {});
+    toast(r.ok ? ('已打开：' + (r.path || '')) : ('打开失败：' + (r.error || '')));
+  }catch(e){ toast('操作失败：' + e.message); }
+}
+
+function readFileAsBase64(file){
+  return new Promise((resolve, reject)=>{
+    const reader = new FileReader();
+    reader.onload = ()=>{
+      const s = String(reader.result || '');
+      const idx = s.indexOf(',');
+      resolve(idx >= 0 ? s.slice(idx + 1) : s);
+    };
+    reader.onerror = ()=>reject(new Error('读取文件失败'));
+    reader.readAsDataURL(file);
+  });
+}
+
+async function sendPickedFiles(asImage){
+  const input = document.getElementById('filePicker');
+  const files = input && input.files ? [...input.files] : [];
+  if (!files.length) return toast('请先选择文件或图片');
+  const msg = document.getElementById('sendFileMsg');
+  if (msg) msg.textContent = '正在读取并推送…';
+  try{
+    if (asImage){
+      const f = files[0];
+      const data_b64 = await readFileAsBase64(f);
+      const r = await api('/api/broadcast', {kind:'image', name:f.name, data_b64});
+      if (!r.ok){
+        if (msg) msg.textContent = '推送失败：' + (r.error || '');
+        return toast('推送失败：' + (r.error || ''));
+      }
+      if (msg) msg.textContent = '已作为图片写入剪贴板并推送给 ' + (r.peers || 0) + ' 个对端';
+      toast('图片已推送');
+    } else {
+      const items = [];
+      for (const f of files){
+        const data_b64 = await readFileAsBase64(f);
+        items.push({name: f.name, size: f.size, mtime: Math.floor((f.lastModified||Date.now())/1000), data_b64});
+      }
+      const r = await api('/api/broadcast', {kind:'files', files: items});
+      if (!r.ok){
+        if (msg) msg.textContent = '推送失败：' + (r.error || '');
+        return toast('推送失败：' + (r.error || ''));
+      }
+      if (msg) msg.textContent = '已作为文件写入剪贴板并推送给 ' + (r.peers || 0) + ' 个对端';
+      toast('文件已推送');
+    }
+    input.value = '';
+    refresh();
+    loadReceived();
+  }catch(e){
+    if (msg) msg.textContent = '推送失败：' + e.message;
+    toast('推送失败：' + e.message);
+  }
+}
+
+function fmtBytes(n){
+  n = Number(n||0);
+  if (n < 1024) return n + ' B';
+  if (n < 1024*1024) return (n/1024).toFixed(1) + ' KB';
+  return (n/1024/1024).toFixed(2) + ' MB';
+}
+
+async function loadReceived(){
+  try{
+    const r = await api('/api/received');
+    const tbody = document.getElementById('recvRows');
+    if (!tbody) return;
+    const list = r.items || [];
+    if (!list.length){
+      tbody.innerHTML = '<tr><td colspan="4" style="color:#6b7280">暂无接收文件</td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.map(it=>{
+      const dl = '/api/received/download?name=' + encodeURIComponent(it.name) + '&t=' + encodeURIComponent(T);
+      const label = it.is_dir ? ('[文件夹] ' + it.name) : it.name;
+      return `<tr>
+        <td style="word-break:break-all">${label}</td>
+        <td>${fmtBytes(it.size)}</td>
+        <td>${fmtTime(it.mtime)}</td>
+        <td><a href="${dl}" target="_blank"><button class="mini">下载</button></a></td>
+      </tr>`;
+    }).join('');
+  }catch(e){ /* 静默 */ }
+}
+
 async function loadLog(){
   try{
     const r = await api('/api/log?lines=200');
@@ -622,12 +791,14 @@ loadLog();
 loadNet();
 fwCheck();
 updateCheck();
+loadReceived();
 document.getElementById('swFwCheck').onchange = (e)=>api('/api/config',{fw_autocheck:e.target.checked});
 document.getElementById('swFwAuto').onchange = (e)=>api('/api/config',{fw_autoopen:e.target.checked});
 setInterval(refresh, 3000);
 setInterval(loadLog, 3000);
 setInterval(loadNet, 6000);
 setInterval(fwCheck, 6000);
+setInterval(loadReceived, 6000);
 setInterval(updateCheck, 300000);
 </script>
 </body>
