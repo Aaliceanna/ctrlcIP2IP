@@ -661,6 +661,7 @@ class WinClipboard:
     CF_HDROP = 15
     CF_UNICODETEXT = 13
     GMEM_MOVEABLE = 0x0002
+    GHND = 0x0042
 
     def __init__(self) -> None:
         self.u = ctypes.WinDLL("user32", use_last_error=True)
@@ -696,6 +697,21 @@ class WinClipboard:
         self.CF_PNG = int(self.u.RegisterClipboardFormatW("PNG") or 0)
         self.CF_IMAGE_PNG = int(self.u.RegisterClipboardFormatW("image/png") or 0)
         self.CF_DROPEFFECT = int(self.u.RegisterClipboardFormatW("Preferred DropEffect") or 0)
+        self._lock = threading.RLock()
+        self._hwnd = None
+        try:
+            self.u.CreateWindowExW.argtypes = [
+                ctypes.c_uint, ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint,
+                ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p,
+            ]
+            self.u.CreateWindowExW.restype = ctypes.c_void_p
+            self._hwnd = self.u.CreateWindowExW(
+                0, "Static", "ClipShareClip", 0, 0, 0, 0, 0,
+                ctypes.c_void_p(-3), None, None, None,
+            )
+        except Exception:
+            self._hwnd = None
 
     def seq(self) -> int:
         try:
@@ -703,7 +719,16 @@ class WinClipboard:
         except Exception:
             return 0
 
-    def _open(self, retries: int = 25, delay: float = 0.02) -> bool:
+    def _open(self, retries: int = 35, delay: float = 0.02, for_write: bool = False) -> bool:
+        owners = (self._hwnd, None) if (for_write and self._hwnd) else (None, self._hwnd)
+        for _ in range(retries):
+            for owner in owners:
+                if self.u.OpenClipboard(owner):
+                    return True
+            time.sleep(delay)
+        return False
+
+    def _open_legacy(self, retries: int = 25, delay: float = 0.02) -> bool:
         for _ in range(retries):
             if self.u.OpenClipboard(None):
                 return True
@@ -734,7 +759,7 @@ class WinClipboard:
         ok = False
         try:
             self.u.EmptyClipboard()
-            h = self.k.GlobalAlloc(self.GMEM_MOVEABLE, len(data))
+            h = self.k.GlobalAlloc(self.GHND, len(data))
             if not h:
                 return False
             p = self.k.GlobalLock(h)
@@ -772,7 +797,7 @@ class WinClipboard:
     def _set_bytes_unlocked(self, fmt: int, data: bytes) -> bool:
         if not fmt or not data:
             return False
-        h = self.k.GlobalAlloc(self.GMEM_MOVEABLE, len(data))
+        h = self.k.GlobalAlloc(self.GHND, len(data))
         if not h:
             return False
         p = self.k.GlobalLock(h)
@@ -877,7 +902,7 @@ class WinClipboard:
                 or (self.CF_PNG and self.u.IsClipboardFormatAvailable(self.CF_PNG))
                 or (self.CF_IMAGE_PNG and self.u.IsClipboardFormatAvailable(self.CF_IMAGE_PNG))
             )
-            if has_hdrop and not has_img:
+            if has_hdrop:
                 files = self._read_files_unlocked()
                 if files:
                     return {"kind": "files", "paths": files}
@@ -915,7 +940,50 @@ class WinClipboard:
         finally:
             self.u.CloseClipboard()
 
+    def _write_files_ps_fallback(self, norm: list[str]) -> bool:
+        try:
+            items_literal = ",".join("'" + p.replace("'", "''") + "'" for p in norm)
+            ps_cmd = (
+                "Add-Type -AssemblyName System.Windows.Forms; "
+                "$sc = New-Object System.Collections.Specialized.StringCollection; "
+                f"@({items_literal}) | ForEach-Object {{ [void]$sc.Add($_) }}; "
+                "[System.Windows.Forms.Clipboard]::SetFileDropList($sc)"
+            )
+            creationflags = 0x08000000 if os.name == "nt" else 0
+            r = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-STA", "-Command", ps_cmd],
+                capture_output=True,
+                timeout=6,
+                creationflags=creationflags,
+            )
+            return r.returncode == 0
+        except Exception as exc:
+            log.debug("PowerShell 写入文件剪贴板回退失败: %s", exc)
+            return False
+
     def write_files(self, paths: list[str]) -> bool:
+        norm = [os.path.abspath(p) for p in (paths or []) if p and os.path.exists(p)]
+        if not norm:
+            return False
+        header = struct.pack("<IiiII", 20, 0, 0, 0, 1)
+        body = ("\x00".join(norm) + "\x00\x00").encode("utf-16-le")
+        drop_data = header + body
+        with self._lock:
+            for attempt in range(8):
+                if self._open(retries=15, delay=0.02, for_write=True):
+                    try:
+                        self.u.EmptyClipboard()
+                        ok = self._set_bytes_unlocked(self.CF_HDROP, drop_data)
+                        if ok and self.CF_DROPEFFECT:
+                            self._set_bytes_unlocked(self.CF_DROPEFFECT, struct.pack("<I", 1))
+                        if ok:
+                            return True
+                    finally:
+                        self.u.CloseClipboard()
+                time.sleep(0.04 * (attempt + 1))
+            return self._write_files_ps_fallback(norm)
+
+    def _write_files_old(self, paths: list[str]) -> bool:
         norm = [os.path.abspath(p) for p in (paths or []) if p and os.path.exists(p)]
         if not norm:
             return False
@@ -1495,6 +1563,8 @@ class Core:
             ok = clipboard().write(text)
             self.last_seq = clipboard().seq()
             self.last_text = text
+            self.last_image_sigs.clear()
+            self.last_files_sigs.clear()
             self.latest = clip
             self.recv_count += 1
             self.last_recv_at = int(time.time())
@@ -1514,6 +1584,8 @@ class Core:
             clipboard().write(text)
             self.last_seq = clipboard().seq()
             self.last_text = text
+            self.last_image_sigs.clear()
+            self.last_files_sigs.clear()
             self.suppress_until = time.time() + 0.6
             self.push_count += 1
             self.last_push_at = int(time.time())
@@ -1604,26 +1676,32 @@ class Core:
             if cid and cid in self.seen:
                 log.debug("← 收到 %s 的图片，但该条已处理过（重试重复投递），跳过", who)
                 return "dup"
-            if cid:
-                self.seen.append(cid)
             if img_sig in self.last_image_sigs or (remote_sha and remote_sha in self.last_image_sigs):
+                if cid:
+                    self.seen.append(cid)
                 log.info("← 收到 %s 的图片，但与本机剪贴板内容完全相同，无需写入（%dx%d）", who, w, h)
                 return "same"
             self.suppress_until = time.time() + 1.0
             c = clipboard()
             ok = c.write_image(png_bytes) if hasattr(c, "write_image") else False
             self.last_seq = c.seq()
-            self.last_image_sigs.append(img_sig)
-            if remote_sha:
-                self.last_image_sigs.append(remote_sha)
             saved = self._save_received_image(png_bytes)
-            if saved:
-                self.last_files_sigs.append(files_path_sig([saved]))
-            self.latest = {k: v for k, v in clip.items() if k != "data_b64"}
-            self.recv_count += 1
-            self.last_recv_at = int(time.time())
-            self.last_kind = "image"
-            self.last_summary = f"图片 {w}×{h} ({fmt_size(len(png_bytes))})"
+            if ok:
+                if cid:
+                    self.seen.append(cid)
+                self.last_text = ""
+                self.last_files_sigs.clear()
+                self.last_image_sigs.clear()
+                self.last_image_sigs.append(img_sig)
+                if remote_sha:
+                    self.last_image_sigs.append(remote_sha)
+                if saved:
+                    self.last_files_sigs.append(files_path_sig([saved]))
+                self.latest = {k: v for k, v in clip.items() if k != "data_b64"}
+                self.recv_count += 1
+                self.last_recv_at = int(time.time())
+                self.last_kind = "image"
+                self.last_summary = f"图片 {w}×{h} ({fmt_size(len(png_bytes))})"
         if ok:
             log.info("← 收到 %s 的图片 %dx%d（%s）", who, w, h, fmt_size(len(png_bytes)))
             return "ok"
@@ -1648,16 +1726,10 @@ class Core:
             )
             return "too_large"
         cid = clip.get("id") or ""
-        remote_sha = str(clip.get("sha256") or "")
         with self.lock:
             if cid and cid in self.seen:
                 log.debug("← 收到 %s 的文件，但该条已处理过（重试重复投递），跳过", who)
                 return "dup"
-            if cid:
-                self.seen.append(cid)
-            if remote_sha and remote_sha in self.last_files_sigs:
-                log.info("← 收到 %s 的文件，但与本机剪贴板内容完全相同，无需写入", who)
-                return "same"
             local_paths, total_bytes, err = unpack_files_payload(clip, recv_dir(self.cfg), max_bytes)
             if err or not local_paths:
                 if "超过上限" in (err or ""):
@@ -1669,9 +1741,12 @@ class Core:
             c = clipboard()
             ok = c.write_files(local_paths) if hasattr(c, "write_files") else True
             self.last_seq = c.seq()
-            if remote_sha:
-                self.last_files_sigs.append(remote_sha)
+            self.last_text = ""
+            self.last_image_sigs.clear()
+            self.last_files_sigs.clear()
             self.last_files_sigs.append(files_path_sig(local_paths))
+            if ok and cid:
+                self.seen.append(cid)
             names = ", ".join(os.path.basename(p) for p in local_paths[:3])
             if len(local_paths) > 3:
                 names += f" 等 {len(local_paths)} 项"
@@ -1683,7 +1758,7 @@ class Core:
         if ok:
             log.info("← 收到 %s 的文件 %d 项（%s）：%s", who, len(local_paths), fmt_size(total_bytes), names)
             return "ok"
-        log.warning("文件已保存到 %s，但写入系统剪贴板失败", recv_dir(self.cfg))
+        log.warning("文件已保存到 %s（可直接打开接收目录使用），但写入系统剪贴板失败", recv_dir(self.cfg))
         return "write_failed"
 
     def broadcast_image(self, raw_bytes: bytes, origin: str = "local", write_clip: bool = True) -> dict:
@@ -1699,6 +1774,9 @@ class Core:
             if write_clip and hasattr(c, "write_image"):
                 c.write_image(png_bytes)
             self.last_seq = c.seq()
+            self.last_text = ""
+            self.last_files_sigs.clear()
+            self.last_image_sigs.clear()
             self.last_image_sigs.append(img_sig)
             self.suppress_until = time.time() + 1.0
             self.push_count += 1
@@ -1732,8 +1810,10 @@ class Core:
             if write_clip and hasattr(c, "write_files"):
                 c.write_files(paths)
             self.last_seq = c.seq()
+            self.last_text = ""
+            self.last_image_sigs.clear()
+            self.last_files_sigs.clear()
             self.last_files_sigs.append(files_path_sig(paths))
-            self.last_files_sigs.append(payload["sha256"])
             self.suppress_until = time.time() + 1.0
             self.push_count += 1
             self.last_push_at = int(time.time())
@@ -1848,6 +1928,13 @@ def poller_loop(core: Core) -> None:
             if time.time() < core.suppress_until:
                 continue  # 自己刚写入的，不回推
             item = clip.read_item() if hasattr(clip, "read_item") else None
+            if item is None and hasattr(clip, "read_item"):
+                # 资源管理器 / 截图工具可能先 EmptyClipboard 触发 seq 变化，几十毫秒后才完成 SetClipboardData
+                for _ in range(2):
+                    time.sleep(0.06)
+                    item = clip.read_item()
+                    if item is not None:
+                        break
             if item is None and not hasattr(clip, "read_item"):
                 t_fallback = clip.read()
                 if t_fallback:
@@ -1878,8 +1965,11 @@ def poller_loop(core: Core) -> None:
                         continue
                     w, h, img_sig = image_info(png_bytes)
                     with core.lock:
+                        core.last_text = ""
+                        core.last_files_sigs.clear()
                         if img_sig in core.last_image_sigs:
                             continue
+                        core.last_image_sigs.clear()
                         core.last_image_sigs.append(img_sig)
                         core.push_count += 1
                         core.last_push_at = int(time.time())
@@ -1910,8 +2000,14 @@ def poller_loop(core: Core) -> None:
                     continue
                 p_sig = files_path_sig(fpaths)
                 with core.lock:
+                    core.last_text = ""
+                    core.last_image_sigs.clear()
+                    # 只拦截本机刚从对端接收并写进剪贴板的那一次回环；
+                    # 用户手动复制文件（包括重复复制同一文件，或中间复制其它内容后再复制该文件）一律放行推送
                     if p_sig in core.last_files_sigs:
+                        core.last_files_sigs.clear()
                         continue
+                    core.last_files_sigs.clear()
                 max_mb = max(1, int(core.cfg.get("max_file_mb") or 50))
                 payload, err = pack_files_payload(fpaths, core.cfg["name"], max_bytes=max_mb * 1024 * 1024)
                 if not payload:
@@ -1920,10 +2016,6 @@ def poller_loop(core: Core) -> None:
                         log.warning("剪贴板文件跳过：%s", err)
                     continue
                 with core.lock:
-                    if payload["sha256"] in core.last_files_sigs:
-                        continue
-                    core.last_files_sigs.append(p_sig)
-                    core.last_files_sigs.append(payload["sha256"])
                     core.push_count += 1
                     core.last_push_at = int(time.time())
                     names = ", ".join(payload["roots"][:3])
@@ -1946,7 +2038,7 @@ def poller_loop(core: Core) -> None:
                 # 同一次「非文本复制」只提示一次（seq 变了才算新的一次）。
                 if core.nontext_seq != seq:
                     core.nontext_seq = seq
-                    log.info("剪贴板内容是图片/文件等非文本，暂不支持同步（当前只同步纯文本），已跳过")
+                    log.debug("剪贴板内容为空或未识别的非文本格式，已跳过")
                 continue
             if len(text.encode("utf-8")) > core.cfg["max_kb"] * 1024:
                 log.debug("内容超过 %d KB，跳过", core.cfg["max_kb"])
@@ -1955,6 +2047,8 @@ def poller_loop(core: Core) -> None:
                 if text == core.last_text:
                     continue
                 core.last_text = text
+                core.last_image_sigs.clear()
+                core.last_files_sigs.clear()
                 core.push_count += 1
                 core.last_push_at = int(time.time())
             payload = {
@@ -5080,6 +5174,62 @@ def _copy_my_link() -> str:
     return link
 
 
+def _reconnect_peers() -> str:
+    if CORE is None:
+        return "服务未运行"
+    CORE.reload()
+    peers = list(CORE.cfg.get("peers") or [])
+    if not peers:
+        return "当前尚未绑定任何对端"
+    ok_count = 0
+    changed = False
+    details = []
+    for p in peers:
+        key = peer_key(p)
+        ok, detail = handshake(p, timeout=4.0)
+        if ok:
+            ok_count += 1
+            CORE.peer_state[key] = {"ok": True, "err": "", "ts": int(time.time())}
+            rev = reverse_bind(CORE.cfg, p, timeout=4.0)
+            mut = rev_is_mutual(rev)
+            if p.get("mutual") != mut:
+                p["mutual"] = mut
+                changed = True
+            details.append(f"{p.get('name') or key}: ○ 正常")
+        else:
+            CORE.peer_state[key] = {"ok": False, "err": detail, "ts": int(time.time())}
+            details.append(f"{p.get('name') or key}: × {detail}")
+    if changed:
+        save_config(CORE.cfg)
+    summary = f"重连完成：{ok_count}/{len(peers)} 个对端在线\n" + "\n".join(details[:4])
+    log.info("手动重连对端：%d/%d 在线（%s）", ok_count, len(peers), "; ".join(details))
+    return summary
+
+
+def _restart_app() -> None:
+    def _worker():
+        time.sleep(0.15)
+        log.info("收到重启指令，正在重启服务进程…")
+        if CORE:
+            CORE.stop_event.set()
+        if SERVER:
+            _stop_server(SERVER)
+        instance_lock_release()
+        try:
+            spawn_background()
+        except Exception as exc:
+            log.error("拉起新实例失败: %s", exc)
+        if TRAY is not None:
+            try:
+                TRAY.stop()
+            except Exception:
+                pass
+        time.sleep(0.3)
+        os._exit(0)
+
+    threading.Thread(target=_worker, daemon=True, name="restarting").start()
+
+
 def _open_recv_dir() -> None:
     rdir = recv_dir(CORE.cfg if CORE else None)
     os.makedirs(rdir, exist_ok=True)
@@ -5177,6 +5327,8 @@ def cmd_gui(args, cfg: dict) -> int:
         "copy_link": _copy_my_link,
         "open_recv": _open_recv_dir,
         "open_log": _open_log_file,
+        "reconnect": _reconnect_peers,
+        "restart": _restart_app,
         "shutdown": _shutdown,
         "fw_label": lambda: f"防火墙放行 TCP {CORE.cfg['port']}"
                             + ("（点击恢复）" if fw_managed(int(CORE.cfg["port"])) else "（点击放行）"),

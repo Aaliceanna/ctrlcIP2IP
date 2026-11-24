@@ -63,6 +63,8 @@ class TrayApp:
             MenuItem(lambda i: self.h.get("update_label", lambda: "检查更新…")(),
                      self._do_update),
             Menu.SEPARATOR,
+            MenuItem("重新连接对端", self._reconnect),
+            MenuItem("重启 ClipShare", self._restart),
             MenuItem("退出 ClipShare", self._quit),
         )
         return pystray.Icon(
@@ -115,6 +117,22 @@ class TrayApp:
 
     def _open_log(self, icon=None, item=None) -> None:
         self.h["open_log"]()
+
+    def _reconnect(self, icon=None, item=None) -> None:
+        fn = self.h.get("reconnect")
+        if fn:
+            try:
+                msg = fn()
+            except Exception as exc:
+                msg = f"重连失败：{exc}"
+            if msg:
+                self._notify(msg)
+
+    def _restart(self, icon=None, item=None) -> None:
+        fn = self.h.get("restart")
+        if fn:
+            self._notify("正在重启 ClipShare…")
+            fn()
 
     def _quit(self, icon=None, item=None) -> None:
         try:
